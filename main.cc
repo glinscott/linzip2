@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <queue>
 #include <vector>
 
 struct ChunkHeader {
@@ -86,6 +87,118 @@ private:
   uint8_t* current_;
   uint32_t bits_ = 0;
   int position_ = 0;
+};
+
+class HuffmanEncoder {
+private:
+  struct Node {
+    int freq;
+    int symbol;
+    Node* l;
+    Node* r;
+  };
+
+  struct Comparator {
+    bool operator()(const Node* l, const Node* r) {
+      return l->freq > r->freq;
+    }
+  };
+
+public:
+  HuffmanEncoder(uint8_t* buffer, size_t buf_size, int target_size)
+    : buffer_(buffer),
+      buf_size_(buf_size),
+      target_size_(target_size) {
+    for (int i = 0; i < 256; ++i) {
+      freq_[i].symbol = i;
+    }
+  }
+
+  void scan(int symbol) {
+    ++freq_[symbol].freq;
+  }
+
+  void buildTable() {
+    int idx = 256;
+
+    std::priority_queue<Node*, std::vector<Node*>, Comparator> q;
+    const int kSentinel = 9999;
+    for (int i = 0; i < 256; ++i) {
+      if (freq_[i].freq) {
+        q.push(&freq_[i]);
+      } else {
+        freq_[i].freq = kSentinel;
+      }
+    }
+
+    while (q.size() > 1) {
+      Node* n1 = q.top();
+      q.pop();
+      Node* n2 = q.top();
+      q.pop();
+
+      Node* add = &freq_[idx++];
+      add->symbol = -1;
+      add->l = n2;
+      add->r = n1;
+      add->freq = n1->freq + n2->freq;
+      q.push(add);
+    }
+
+    walk(q.top(), 0);
+
+    // TODO: Not efficient...
+    std::sort(&freq_[0], &freq_[256], [](const Node& l, const Node& r){return l.freq < r.freq;});
+
+    int code = 0;
+    int last_level = -1;
+    for (int i = 0; i < 256; ++i) {
+      if (freq_[i].freq == kSentinel) {
+        break;
+      }
+      int level = freq_[i].freq;
+      if (last_level != level) {
+        if (last_level != -1) {
+          ++code;
+          code <<= (level - last_level);
+        }
+        last_level = level;
+      } else {
+        ++code;
+      }
+      for (int j = 0; j < level; ++j) {
+        printf("%d", ((code>>(level-j-1))&1));
+      }
+      printf(" %x %d %d\n", code, level, freq_[i].symbol);
+    }
+  }
+
+  void walk(Node* n, int level) {
+    if (n->symbol != -1) {
+      n->freq = level;
+      return;
+    }
+
+    walk(n->l, level + 1);
+    walk(n->r, level + 1);
+  }
+
+  void encode(int symbol) {
+  }
+
+  void finish() {
+  }
+
+  int bytesRead() {
+  }
+
+private:
+  uint8_t* buffer_;
+  size_t at_ = 0;
+  size_t buf_size_;
+  int target_size_;
+
+  Node freq_[512] = {0};
 };
 
 class HuffmanDecoder {
@@ -197,6 +310,16 @@ int testBitReader(uint8_t* buf, uint8_t* out, size_t len) {
   return 0;
 }
 
+int testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
+  HuffmanEncoder encoder(out, 256 * 1024, 0);
+  for (size_t i = 0; i < len; ++i) {
+    encoder.scan(buf[i]);
+  }
+  encoder.buildTable();
+
+  return 0;
+}
+
 int main() {
   size_t len;
   std::unique_ptr<uint8_t> buf = enwik8(len);
@@ -205,6 +328,7 @@ int main() {
   out.reset(new uint8_t[len]);
 
   testBitReader(buf.get(), out.get(), 1000);
+  testHuffman(buf.get(), out.get(), 1000);
 
   return 0;
 }
