@@ -1,8 +1,20 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <queue>
+#include <string>
 #include <vector>
+
+#define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
+
+std::string toBinary(int v, int size) {
+  std::string result;
+  for (int j = 0; j < size; ++j) {
+    result += ((v>>(size-j-1))&1) ? "1" : "0";
+  }
+  return result;
+}
 
 struct ChunkHeader {
   uint8_t flags;
@@ -39,11 +51,15 @@ public:
   }
 
   void refill() {
-    while (position_ > 0) {
+    while (position_ >= 0) {
       bits_ |= (current_ < end_ ? *current_ : 0) << position_;
       position_ -= 8;
       ++current_;
     }
+  }
+
+  bool done() const {
+    return current_ >= end_ && position_ == 0;
   }
 
 private:
@@ -56,7 +72,8 @@ private:
 class BitWriter {
 public:
   BitWriter(uint8_t* buffer)
-    : current_(buffer) {
+    : start_(buffer),
+      current_(buffer) {
   }
 
   void writeBit(int v) {
@@ -75,8 +92,20 @@ public:
     }
   }
 
+  size_t finish() {
+    flush();
+    CHECK(position_ >= 0 && position_ < 8);
+    if (position_ > 0) {
+      // Final byte is a bit tricky.  Handle it specially.
+      *current_ = (bits_ & ((1 << position_) - 1)) << (8 - position_);
+      ++current_;
+    }
+    return current_ - start_;
+  }
+
+private:
   void flush() {
-    while (position_ > 0) {
+    while (position_ >= 8) {
       *current_ = (bits_ >> (position_ - 8)) & 0xFF;
       position_ -= 8;
       ++current_;
@@ -84,6 +113,7 @@ public:
   }
 
 private:
+  uint8_t* start_;
   uint8_t* current_;
   uint32_t bits_ = 0;
   int position_ = 0;
@@ -107,6 +137,7 @@ private:
 public:
   HuffmanEncoder(uint8_t* buffer, size_t buf_size, int target_size)
     : buffer_(buffer),
+      writer_(buffer_),
       buf_size_(buf_size),
       target_size_(target_size) {
     for (int i = 0; i < 256; ++i) {
@@ -123,9 +154,11 @@ public:
 
     std::priority_queue<Node*, std::vector<Node*>, Comparator> q;
     const int kSentinel = 9999;
+    int num_symbols = 0;
     for (int i = 0; i < 256; ++i) {
       if (freq_[i].freq) {
         q.push(&freq_[i]);
+        ++num_symbols;
       } else {
         freq_[i].freq = kSentinel;
       }
@@ -150,12 +183,13 @@ public:
     // TODO: Not efficient...
     std::sort(&freq_[0], &freq_[256], [](const Node& l, const Node& r){return l.freq < r.freq;});
 
+    writer_.writeBits(num_symbols, 8);
+    writer_.writeBits(4, 3);
+
     int code = 0;
     int last_level = -1;
-    for (int i = 0; i < 256; ++i) {
-      if (freq_[i].freq == kSentinel) {
-        break;
-      }
+    for (int i = 0; i < num_symbols; ++i) {
+      CHECK(freq_[i].freq != kSentinel);
       int level = freq_[i].freq;
       if (last_level != level) {
         if (last_level != -1) {
@@ -166,10 +200,15 @@ public:
       } else {
         ++code;
       }
-      for (int j = 0; j < level; ++j) {
-        printf("%d", ((code>>(level-j-1))&1));
-      }
-      printf(" %x %d %d\n", code, level, freq_[i].symbol);
+
+      int symbol = freq_[i].symbol;
+      length_[symbol] = level;
+      code_[symbol] = code;
+
+      writer_.writeBits(freq_[i].symbol, 8);
+      writer_.writeBits(level - 1, 4);
+
+      // printf("code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, freq_[i].symbol);
     }
   }
 
@@ -184,40 +223,43 @@ public:
   }
 
   void encode(int symbol) {
+    writer_.writeBits(code_[symbol], length_[symbol]);
   }
 
-  void finish() {
-  }
-
-  int bytesRead() {
+  size_t finish() {
+    return writer_.finish();
   }
 
 private:
   uint8_t* buffer_;
+  BitWriter writer_;
   size_t at_ = 0;
   size_t buf_size_;
   int target_size_;
 
   Node freq_[512] = {0};
+
+  uint8_t length_[256] = {0};
+  int code_[256] = {0};
 };
 
 class HuffmanDecoder {
 public:
-  HuffmanDecoder(uint8_t* buffer, uint8_t* end)
-    : br_(buffer, end) {
+  HuffmanDecoder(uint8_t* buffer, uint8_t* end, uint8_t* output)
+    : br_(buffer, end),
+      output_(output) {
   }
 
   bool readTable() {
-    int sym_bits = log2RoundUp(num_symbols_);
+    int sym_bits = 8;
 
     br_.refill();
     num_symbols_ = br_.readBits(sym_bits);
 
-    if (num_symbols_ > kMaxSymbols) {
-      return false;
-    }
+    CHECK(num_symbols_ <= kMaxSymbols);
 
     int codelen_bits = br_.readBits(3);
+    printf("num_sym %d codelen_bits %d\n", num_symbols_, codelen_bits);
     for (int i = 0; i < num_symbols_; ++i) {
       br_.refill();
       int symbol = br_.readBits(sym_bits);
@@ -225,7 +267,8 @@ public:
 
       ++codelen_count_[codelen];
       last_used_symbol_ = symbol;
-      symbol_length_[symbol] = codelen;
+      symbol_length_[i] = codelen;
+      symbol_[i] = symbol;
       min_codelen_ = std::min(min_codelen_, codelen);
       max_codelen_ = std::max(max_codelen_, codelen);
     }
@@ -234,24 +277,38 @@ public:
   }
 
   bool assignCodes() {
-    int local_syms[17] = {0};
-    int x = 0;
-    int y = 0;
-    int z = 0;
+    int p = 0;
+    uint8_t* cursym = &symbol_[0];
     for (int i = min_codelen_; i <= max_codelen_; ++i) {
-      local_syms[i] = x;
-      z = codelen_count_[i] + y;
-      // int g_i = y - x;
-      // int f_i = z << (32 - i);
-      y = 2 * z;
-      x += codelen_count_[i];
+      int n = codelen_count_[i];
+      if (n) {
+        int shift = max_codelen_ - i;
+        memset(bits_to_len_ + p, i, n << shift);
+        int m = 1 << shift;
+        do {
+          memset(bits_to_sym_ + p, *cursym++, m);
+          p += m;
+        } while(--n);
+      }
     }
-    if (z != (1 << max_codelen_)) {
-      return false;
-    }
-    uint8_t* C;
-    for (int i = 0; i < last_used_symbol_ + 1; i++) {
-      C[local_syms[symbol_length_[i]]++] = i;
+
+    return true;
+  }
+
+  bool decode() {
+    br_.refill();
+    int bits = br_.readBits(10);
+    int bitpos = 0;
+    for (;;) {
+      int n = bits & 0x3ff;
+      int len = bits_to_len_[n];
+      *output_++ = bits_to_sym_[n];
+      bits <<= len;
+      br_.refill();
+      bits |= br_.readBits(len);
+      if (br_.done()) {
+        break;
+      }
     }
     return true;
   }
@@ -261,12 +318,17 @@ private:
   static const int kMaxCodeLength = 11;
 
   BitReader br_;
+  uint8_t* output_;
   int num_symbols_;
   int last_used_symbol_;
   int min_codelen_ = 255;
   int max_codelen_ = 0;
   int codelen_count_[17] = {0};
   uint8_t symbol_length_[kMaxSymbols] = {0}; 
+
+  uint8_t symbol_[256] = {0};
+  uint8_t bits_to_sym_[0x7ff] = {0};
+  uint8_t bits_to_len_[0x7ff] = {0};
 };
 
 void compress() {
@@ -316,6 +378,25 @@ int testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
     encoder.scan(buf[i]);
   }
   encoder.buildTable();
+  for (size_t i = 0; i < len; ++i) {
+    encoder.encode(buf[i]);
+  }
+  size_t encoded_size = encoder.finish();
+  printf("Encoded into %zu bytes\n", encoded_size);
+
+  uint8_t decoded[len];
+  HuffmanDecoder decoder(out, out + encoded_size, decoded);
+  CHECK(decoder.readTable());
+  CHECK(decoder.assignCodes());
+  CHECK(decoder.decode());
+
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t orig = buf[i];
+    uint8_t v = decoded[i];
+    if (orig != v) {
+      fprintf(stderr, "busted_huff %ld,%d,%d\n", i, orig, v);
+    }
+  }
 
   return 0;
 }
