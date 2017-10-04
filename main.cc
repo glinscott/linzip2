@@ -6,7 +6,10 @@
 #include <string>
 #include <vector>
 
+constexpr int kDebugLevel = 0;
+
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
+#define LOGV(level, s, ...) do{if(level<=kDebugLevel) fprintf(stderr, s, ##__VA_ARGS__);}while(0);
 
 std::string toBinary(int v, int size) {
   std::string result;
@@ -58,8 +61,20 @@ public:
     }
   }
 
-  bool done() const {
-    return current_ >= end_ && position_ == 0;
+  uint8_t* current() const {
+    return current_;
+  }
+
+  uint8_t* end() const {
+    return end_;
+  }
+
+  uint32_t bits() const {
+    return bits_;
+  }
+
+  int position() const {
+    return position_;
   }
 
 private:
@@ -178,7 +193,7 @@ public:
       q.push(add);
     }
 
-    walk(q.top(), 0);
+    walk(q.top(), num_symbols == 1 ? 1 : 0);
 
     // TODO: Not efficient...
     std::sort(&freq_[0], &freq_[256], [](const Node& l, const Node& r){return l.freq < r.freq;});
@@ -208,7 +223,7 @@ public:
       writer_.writeBits(freq_[i].symbol, 8);
       writer_.writeBits(level - 1, 4);
 
-      // printf("code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, freq_[i].symbol);
+      LOGV(1, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
     }
   }
 
@@ -245,9 +260,10 @@ private:
 
 class HuffmanDecoder {
 public:
-  HuffmanDecoder(uint8_t* buffer, uint8_t* end, uint8_t* output)
+  HuffmanDecoder(uint8_t* buffer, uint8_t* end, uint8_t* output, uint8_t* output_end)
     : br_(buffer, end),
-      output_(output) {
+      output_(output),
+      output_end_(output_end) {
   }
 
   bool readTable() {
@@ -259,11 +275,11 @@ public:
     CHECK(num_symbols_ <= kMaxSymbols);
 
     int codelen_bits = br_.readBits(3);
-    printf("num_sym %d codelen_bits %d\n", num_symbols_, codelen_bits);
     for (int i = 0; i < num_symbols_; ++i) {
       br_.refill();
       int symbol = br_.readBits(sym_bits);
       int codelen = br_.readBits(codelen_bits) + 1;
+      LOGV(1, "sym:%d len:%d\n", symbol, codelen);
 
       ++codelen_count_[codelen];
       last_used_symbol_ = symbol;
@@ -272,6 +288,7 @@ public:
       min_codelen_ = std::min(min_codelen_, codelen);
       max_codelen_ = std::max(max_codelen_, codelen);
     }
+    LOGV(1, "num_sym %d codelen_bits %d codelen(min:%d, max:%d)\n", num_symbols_, codelen_bits, min_codelen_, max_codelen_);
 
     return true;
   }
@@ -297,17 +314,21 @@ public:
 
   bool decode() {
     br_.refill();
-    int bits = br_.readBits(10);
-    int bitpos = 0;
+    uint8_t* src = br_.current();
+    uint32_t bits = br_.bits();
+    int position = br_.position();
     for (;;) {
-      int n = bits & 0x3ff;
+      int n = bits >> (32 - max_codelen_);
       int len = bits_to_len_[n];
       *output_++ = bits_to_sym_[n];
-      bits <<= len;
-      br_.refill();
-      bits |= br_.readBits(len);
-      if (br_.done()) {
+      if (output_ >= output_end_) {
         break;
+      }
+      bits <<= len;
+      position += len;
+      if (position >= 0) {
+        bits |= *src++ << position;
+        position -= 8;
       }
     }
     return true;
@@ -319,6 +340,7 @@ private:
 
   BitReader br_;
   uint8_t* output_;
+  uint8_t* output_end_;
   int num_symbols_;
   int last_used_symbol_;
   int min_codelen_ = 255;
@@ -327,8 +349,8 @@ private:
   uint8_t symbol_length_[kMaxSymbols] = {0}; 
 
   uint8_t symbol_[256] = {0};
-  uint8_t bits_to_sym_[0x7ff] = {0};
-  uint8_t bits_to_len_[0x7ff] = {0};
+  uint8_t bits_to_sym_[0x800] = {0};
+  uint8_t bits_to_len_[0x800] = {0};
 };
 
 void compress() {
@@ -372,8 +394,8 @@ int testBitReader(uint8_t* buf, uint8_t* out, size_t len) {
   return 0;
 }
 
-int testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
-  HuffmanEncoder encoder(out, 256 * 1024, 0);
+bool testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
+  HuffmanEncoder encoder(out, len, 0);
   for (size_t i = 0; i < len; ++i) {
     encoder.scan(buf[i]);
   }
@@ -382,23 +404,29 @@ int testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
     encoder.encode(buf[i]);
   }
   size_t encoded_size = encoder.finish();
-  printf("Encoded into %zu bytes\n", encoded_size);
+  printf("Encoded %zu into %zu bytes\n", len, encoded_size);
 
-  uint8_t decoded[len];
-  HuffmanDecoder decoder(out, out + encoded_size, decoded);
+  std::unique_ptr<uint8_t> decoded;
+  decoded.reset(new uint8_t[len]);
+  HuffmanDecoder decoder(out, out + encoded_size, decoded.get(), decoded.get() + len);
   CHECK(decoder.readTable());
   CHECK(decoder.assignCodes());
   CHECK(decoder.decode());
 
+  int bad = 0;
   for (size_t i = 0; i < len; ++i) {
     uint8_t orig = buf[i];
-    uint8_t v = decoded[i];
+    uint8_t v = decoded.get()[i];
     if (orig != v) {
-      fprintf(stderr, "busted_huff %ld,%d,%d\n", i, orig, v);
+      if (++bad > 20) {
+        fprintf(stderr, "more than 20 busted\n");
+        break;
+      }
+      fprintf(stderr, "busted_huff idx:%ld,orig:%d,decoded:%d\n", i, orig, v);
     }
   }
 
-  return 0;
+  return bad == 0;
 }
 
 int main() {
@@ -409,7 +437,9 @@ int main() {
   out.reset(new uint8_t[len]);
 
   testBitReader(buf.get(), out.get(), 1000);
-  testHuffman(buf.get(), out.get(), 1000);
+  for (int i = 1; i < 1000; ++i) {
+    CHECK(testHuffman(buf.get(), out.get(), i));
+  }
 
   return 0;
 }
