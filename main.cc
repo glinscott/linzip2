@@ -1,15 +1,23 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <queue>
 #include <string>
 #include <vector>
 
-constexpr int kDebugLevel = 0;
+constexpr int kDebugLevel = 1;
 
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
 #define LOGV(level, s, ...) do{if(level<=kDebugLevel) fprintf(stderr, s, ##__VA_ARGS__);}while(0);
+
+struct Timer {
+  Timer() : time_(std::chrono::high_resolution_clock::now()) {}
+  double elapsed() const { return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now()-time_).count(); }
+  std::chrono::high_resolution_clock::time_point time_;
+};
 
 std::string toBinary(int v, int size) {
   std::string result;
@@ -164,6 +172,34 @@ public:
     ++freq_[symbol].freq;
   }
 
+  void writeTable(int num_symbols) {
+    writer_.writeBits(num_symbols, 8);
+
+    int code = 0;
+    int last_level = -1;
+    for (int i = 0; i < num_symbols; ++i) {
+      int level = freq_[i].freq;
+      if (last_level != level) {
+        if (last_level != -1) {
+          ++code;
+          code <<= (level - last_level);
+        }
+        last_level = level;
+      } else {
+        ++code;
+      }
+
+      int symbol = freq_[i].symbol;
+      length_[symbol] = level;
+      code_[symbol] = code;
+
+      writer_.writeBits(freq_[i].symbol, 8);
+      writer_.writeBits(level - 1, 4);
+
+      LOGV(1, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
+    }
+  }
+
   void buildTable() {
     int idx = 256;
 
@@ -198,33 +234,30 @@ public:
     // TODO: Not efficient...
     std::sort(&freq_[0], &freq_[256], [](const Node& l, const Node& r){return l.freq < r.freq;});
 
-    writer_.writeBits(num_symbols, 8);
-    writer_.writeBits(4, 3);
-
-    int code = 0;
-    int last_level = -1;
-    for (int i = 0; i < num_symbols; ++i) {
-      CHECK(freq_[i].freq != kSentinel);
-      int level = freq_[i].freq;
-      if (last_level != level) {
-        if (last_level != -1) {
-          ++code;
-          code <<= (level - last_level);
-        }
-        last_level = level;
-      } else {
-        ++code;
-      }
-
-      int symbol = freq_[i].symbol;
-      length_[symbol] = level;
-      code_[symbol] = code;
-
-      writer_.writeBits(freq_[i].symbol, 8);
-      writer_.writeBits(level - 1, 4);
-
-      LOGV(1, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
+    // Limit the maximum code length
+    int k = 0;
+    int maxk = (1 << 11) - 1;
+    for (int i = num_symbols - 1; i >= 0; --i) {
+      freq_[i].freq = std::min(freq_[i].freq, 11);
+      k += 1 << (11 - freq_[i].freq);
     }
+    printf("k before: %.6lf\n", k / double(maxk));
+    for (int i = num_symbols - 1; i >= 0 && k > maxk; --i) {
+      while (freq_[i].freq < 11) {
+        ++freq_[i].freq;
+        k -= 1 << (11 - freq_[i].freq);
+      }
+    }
+    printf("k pass1: %.6lf\n", k / double(maxk));
+    for (int i = 0; i < num_symbols; ++i) {
+      while (k + (1 << (11 - freq_[i].freq)) <= maxk) {
+        k += 1 << (11 - freq_[i].freq);
+        --freq_[i].freq;
+      }
+    }
+    printf("k pass2: %x, %x\n", k, maxk);
+
+    writeTable(num_symbols);
   }
 
   void walk(Node* n, int level) {
@@ -235,6 +268,26 @@ public:
 
     walk(n->l, level + 1);
     walk(n->r, level + 1);
+  }
+
+  void buildOptimalLengthLimitedTable() {
+    // Compress to just the used symbols
+    int num_symbols = 0;
+    for (int i = 0; i < 256; ++i) {
+      if (freq_[i].freq != 0) {
+        freq_[num_symbols++] = freq_[i];
+      }
+    }
+    std::sort(&freq_[0], &freq_[num_symbols], [](const Node& l, const Node& r){return l.freq < r.freq;});
+    uint16_t coins[256];
+
+    for (int i = 0; i < num_symbols; ++i) {
+      coins[i] = 0x7ff;
+    }
+
+    // TODO
+
+    writeTable(num_symbols);
   }
 
   void encode(int symbol) {
@@ -274,12 +327,11 @@ public:
 
     CHECK(num_symbols_ <= kMaxSymbols);
 
-    int codelen_bits = br_.readBits(3);
     for (int i = 0; i < num_symbols_; ++i) {
       br_.refill();
       int symbol = br_.readBits(sym_bits);
-      int codelen = br_.readBits(codelen_bits) + 1;
-      LOGV(1, "sym:%d len:%d\n", symbol, codelen);
+      int codelen = br_.readBits(4) + 1;
+      LOGV(2, "sym:%d len:%d\n", symbol, codelen);
 
       ++codelen_count_[codelen];
       last_used_symbol_ = symbol;
@@ -288,7 +340,7 @@ public:
       min_codelen_ = std::min(min_codelen_, codelen);
       max_codelen_ = std::max(max_codelen_, codelen);
     }
-    LOGV(1, "num_sym %d codelen_bits %d codelen(min:%d, max:%d)\n", num_symbols_, codelen_bits, min_codelen_, max_codelen_);
+    LOGV(1, "num_sym %d codelen(min:%d, max:%d)\n", num_symbols_, min_codelen_, max_codelen_);
 
     return true;
   }
@@ -326,7 +378,7 @@ public:
       }
       bits <<= len;
       position += len;
-      if (position >= 0) {
+      while (position >= 0) {
         bits |= *src++ << position;
         position -= 8;
       }
@@ -334,10 +386,10 @@ public:
     return true;
   }
 
-private:
   static const int kMaxSymbols = 256;
   static const int kMaxCodeLength = 11;
 
+private:
   BitReader br_;
   uint8_t* output_;
   uint8_t* output_end_;
@@ -353,11 +405,23 @@ private:
   uint8_t bits_to_len_[0x800] = {0};
 };
 
-void compress() {
+size_t compress(uint8_t* buf, size_t len, uint8_t* out) {
+  HuffmanEncoder encoder(out, len, 0);
+  for (size_t i = 0; i < len; ++i) {
+    encoder.scan(buf[i]);
+  }
+  encoder.buildTable();
+  for (size_t i = 0; i < len; ++i) {
+    encoder.encode(buf[i]);
+  }
+  return encoder.finish();
 }
 
-void decompress() {
-  // read compressed 256kb chunk
+void decompress(uint8_t* buf, size_t len, uint8_t* out, size_t out_len) {
+  HuffmanDecoder decoder(buf, buf + len, out, out + out_len);
+  CHECK(decoder.readTable());
+  CHECK(decoder.assignCodes());
+  CHECK(decoder.decode());
 }
 
 std::unique_ptr<uint8_t> enwik8(size_t& len) {
@@ -404,7 +468,7 @@ bool testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
     encoder.encode(buf[i]);
   }
   size_t encoded_size = encoder.finish();
-  printf("Encoded %zu into %zu bytes\n", len, encoded_size);
+  // printf("Encoded %zu into %zu bytes\n", len, encoded_size);
 
   std::unique_ptr<uint8_t> decoded;
   decoded.reset(new uint8_t[len]);
@@ -436,9 +500,28 @@ int main() {
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
 
+  /*
   testBitReader(buf.get(), out.get(), 1000);
   for (int i = 1; i < 1000; ++i) {
     CHECK(testHuffman(buf.get(), out.get(), i));
+  }
+  */
+
+  size_t encoded_size;
+  {
+    Timer timer;
+    encoded_size = compress(buf.get(), len, out.get());
+    double elapsed = timer.elapsed() / 1000;
+    printf("Encoded %zu into %zu bytes\n", len, encoded_size);
+    printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
+  }
+
+  {
+    Timer timer;
+    decompress(out.get(), encoded_size, buf.get(), len);
+    double elapsed = timer.elapsed() / 1000;
+    printf("Decompression\n");
+    printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
   }
 
   return 0;
