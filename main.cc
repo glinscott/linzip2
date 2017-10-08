@@ -142,6 +142,8 @@ private:
   int position_ = 0;
 };
 
+const int kMaxHuffCodeLength = 11;
+
 class HuffmanEncoder {
 private:
   struct Node {
@@ -200,6 +202,31 @@ public:
     }
   }
 
+  void limitLength(int num_symbols) {
+    // Limit the maximum code length
+    int k = 0;
+    int maxk = (1 << kMaxHuffCodeLength) - 1;
+    for (int i = num_symbols - 1; i >= 0; --i) {
+      freq_[i].freq = std::min(freq_[i].freq, 11);
+      k += 1 << (kMaxHuffCodeLength - freq_[i].freq);
+    }
+    LOGV(2, "k before: %.6lf\n", k / double(maxk));
+    for (int i = num_symbols - 1; i >= 0 && k > maxk; --i) {
+      while (freq_[i].freq < kMaxHuffCodeLength) {
+        ++freq_[i].freq;
+        k -= 1 << (kMaxHuffCodeLength - freq_[i].freq);
+      }
+    }
+    LOGV(2, "k pass1: %.6lf\n", k / double(maxk));
+    for (int i = 0; i < num_symbols; ++i) {
+      while (k + (1 << (kMaxHuffCodeLength - freq_[i].freq)) <= maxk) {
+        k += 1 << (kMaxHuffCodeLength - freq_[i].freq);
+        --freq_[i].freq;
+      }
+    }
+    LOGV(2, "k pass2: %x, %x\n", k, maxk);
+  }
+
   void buildTable() {
     int idx = 256;
 
@@ -234,29 +261,7 @@ public:
     // TODO: Not efficient...
     std::sort(&freq_[0], &freq_[256], [](const Node& l, const Node& r){return l.freq < r.freq;});
 
-    // Limit the maximum code length
-    int k = 0;
-    int maxk = (1 << 11) - 1;
-    for (int i = num_symbols - 1; i >= 0; --i) {
-      freq_[i].freq = std::min(freq_[i].freq, 11);
-      k += 1 << (11 - freq_[i].freq);
-    }
-    printf("k before: %.6lf\n", k / double(maxk));
-    for (int i = num_symbols - 1; i >= 0 && k > maxk; --i) {
-      while (freq_[i].freq < 11) {
-        ++freq_[i].freq;
-        k -= 1 << (11 - freq_[i].freq);
-      }
-    }
-    printf("k pass1: %.6lf\n", k / double(maxk));
-    for (int i = 0; i < num_symbols; ++i) {
-      while (k + (1 << (11 - freq_[i].freq)) <= maxk) {
-        k += 1 << (11 - freq_[i].freq);
-        --freq_[i].freq;
-      }
-    }
-    printf("k pass2: %x, %x\n", k, maxk);
-
+    limitLength(num_symbols);
     writeTable(num_symbols);
   }
 
@@ -387,7 +392,6 @@ public:
   }
 
   static const int kMaxSymbols = 256;
-  static const int kMaxCodeLength = 11;
 
 private:
   BitReader br_;
@@ -522,6 +526,13 @@ int main() {
     double elapsed = timer.elapsed() / 1000;
     printf("Decompression\n");
     printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
+  }
+  {
+    std::unique_ptr<uint8_t> truth = enwik8(len);
+    for (int i = 0; i < len; ++i) {
+      CHECK(truth.get()[i] == buf.get()[i]);
+    }
+    printf("Decompression validated!\n");
   }
 
   return 0;
