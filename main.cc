@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-constexpr int kDebugLevel = 1;
+constexpr int kDebugLevel = 0;
 
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
 #define LOGV(level, s, ...) do{if(level<=kDebugLevel) fprintf(stderr, s, ##__VA_ARGS__);}while(0);
@@ -122,6 +122,7 @@ public:
       // Final byte is a bit tricky.  Handle it specially.
       *current_ = (bits_ & ((1 << position_) - 1)) << (8 - position_);
       ++current_;
+      position_ = 0;
     }
     return current_ - start_;
   }
@@ -160,11 +161,10 @@ private:
   };
 
 public:
-  HuffmanEncoder(uint8_t* buffer, size_t buf_size, int target_size)
+  HuffmanEncoder(uint8_t* buffer, size_t buf_size)
     : buffer_(buffer),
       writer_(buffer_),
-      buf_size_(buf_size),
-      target_size_(target_size) {
+      buf_size_(buf_size) {
     for (int i = 0; i < 256; ++i) {
       freq_[i].symbol = i;
     }
@@ -200,6 +200,9 @@ public:
 
       LOGV(1, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
     }
+
+    // Byte align after the table
+    writer_.finish();
   }
 
   void limitLength(int num_symbols) {
@@ -308,7 +311,6 @@ private:
   BitWriter writer_;
   size_t at_ = 0;
   size_t buf_size_;
-  int target_size_;
 
   Node freq_[512] = {0};
 
@@ -370,11 +372,16 @@ public:
   }
 
   bool decode() {
-    br_.refill();
-    uint8_t* src = br_.current();
-    uint32_t bits = br_.bits();
-    int position = br_.position();
+    uint8_t* src = br_.current() - ((24 - br_.position()) / 8);
+    uint8_t* src_end = br_.end();
+    int position = 24;
+    uint32_t bits = 0;
+
     for (;;) {
+      while (position >= 0) {
+        bits |= (src < src_end ? *src++ : 0) << position;
+        position -= 8;
+      }
       int n = bits >> (32 - max_codelen_);
       int len = bits_to_len_[n];
       *output_++ = bits_to_sym_[n];
@@ -383,10 +390,6 @@ public:
       }
       bits <<= len;
       position += len;
-      while (position >= 0) {
-        bits |= *src++ << position;
-        position -= 8;
-      }
     }
     return true;
   }
@@ -410,22 +413,49 @@ private:
 };
 
 size_t compress(uint8_t* buf, size_t len, uint8_t* out) {
-  HuffmanEncoder encoder(out, len, 0);
-  for (size_t i = 0; i < len; ++i) {
-    encoder.scan(buf[i]);
+  uint8_t* out_start = out;
+  size_t chunk_size = 1 << 18; // 256k
+  for (size_t start = 0; start < len; start += chunk_size) {
+    size_t remaining = std::min(chunk_size, len - start);
+    uint8_t* marker = out;
+    out += 3;
+
+    HuffmanEncoder encoder(out, remaining);
+    for (size_t i = 0; i < remaining; ++i) {
+      encoder.scan(buf[i]);
+    }
+    encoder.buildTable();
+    for (size_t i = 0; i < remaining; ++i) {
+      encoder.encode(buf[i]);
+    }
+    size_t chunk_written = encoder.finish();
+    marker[0] = chunk_written & 0xff;
+    marker[1] = (chunk_written >> 8) & 0xff;
+    marker[2] = (chunk_written >> 16) & 0xff;
+
+    buf += remaining;
+    out += chunk_written;
   }
-  encoder.buildTable();
-  for (size_t i = 0; i < len; ++i) {
-    encoder.encode(buf[i]);
-  }
-  return encoder.finish();
+  return out - out_start;
 }
 
 void decompress(uint8_t* buf, size_t len, uint8_t* out, size_t out_len) {
-  HuffmanDecoder decoder(buf, buf + len, out, out + out_len);
-  CHECK(decoder.readTable());
-  CHECK(decoder.assignCodes());
-  CHECK(decoder.decode());
+  size_t read = 0;
+  size_t chunk_size = 1 << 18; // 256k
+  uint8_t* buf_end = buf + len;
+  while (buf < buf_end) {
+    int compressed_size = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+    buf += 3;
+
+    HuffmanDecoder decoder(buf, buf + compressed_size, out, out + std::min(chunk_size, out_len));
+    CHECK(decoder.readTable());
+    CHECK(decoder.assignCodes());
+    CHECK(decoder.decode());
+
+    buf += compressed_size;
+    out += chunk_size;
+    out_len -= chunk_size;
+  }
 }
 
 std::unique_ptr<uint8_t> enwik8(size_t& len) {
@@ -463,7 +493,7 @@ int testBitReader(uint8_t* buf, uint8_t* out, size_t len) {
 }
 
 bool testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
-  HuffmanEncoder encoder(out, len, 0);
+  HuffmanEncoder encoder(out, len);
   for (size_t i = 0; i < len; ++i) {
     encoder.scan(buf[i]);
   }
@@ -506,7 +536,7 @@ int main() {
 
   /*
   testBitReader(buf.get(), out.get(), 1000);
-  for (int i = 1; i < 1000; ++i) {
+  for (int i = 1; i < 1000; i += 50) {
     CHECK(testHuffman(buf.get(), out.get(), i));
   }
   */
