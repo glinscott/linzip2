@@ -31,9 +31,9 @@ struct ChunkHeader {
   uint8_t flags;
 };
 
-int log2RoundUp(uint32_t v) {
-  if (v > 1) {
-    return 32 - __builtin_clz(v - 1);
+int log2(int v) {
+  if (v > 0) {
+    return 32 - __builtin_clz(v) - 1;
   } else {
     return 0;
   }
@@ -69,6 +69,13 @@ public:
     }
   }
 
+  void byteAlign() {
+    int extra_bits = position_ & 7;
+    if (extra_bits) {
+      readBits(8 - extra_bits);
+    }
+  }
+
   uint8_t* current() const {
     return current_;
   }
@@ -83,6 +90,11 @@ public:
 
   int position() const {
     return position_;
+  }
+
+  // Actual location we have read up to in the byte stream.
+  uint8_t* cursor() const {
+    return current_ - ((24 - position_) / 8);
   }
 
 private:
@@ -115,7 +127,7 @@ public:
     }
   }
 
-  size_t finish() {
+  int64_t finish() {
     flush();
     CHECK(position_ >= 0 && position_ < 8);
     if (position_ > 0) {
@@ -161,14 +173,14 @@ private:
   };
 
 public:
-  HuffmanEncoder(uint8_t* buffer, size_t buf_size)
-    : buffer_(buffer),
-      writer_(buffer_),
-      buf_size_(buf_size) {
+  HuffmanEncoder(uint8_t* buffer)
+    : writer_(buffer) {
     for (int i = 0; i < 256; ++i) {
       freq_[i].symbol = i;
     }
   }
+
+  BitWriter& writer() { return writer_; }
 
   void scan(int symbol) {
     ++freq_[symbol].freq;
@@ -198,7 +210,7 @@ public:
       writer_.writeBits(freq_[i].symbol, 8);
       writer_.writeBits(level - 1, 4);
 
-      LOGV(1, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
+      LOGV(2, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
     }
 
     // Byte align after the table
@@ -213,21 +225,21 @@ public:
       freq_[i].freq = std::min(freq_[i].freq, 11);
       k += 1 << (kMaxHuffCodeLength - freq_[i].freq);
     }
-    LOGV(2, "k before: %.6lf\n", k / double(maxk));
+    LOGV(3, "k before: %.6lf\n", k / double(maxk));
     for (int i = num_symbols - 1; i >= 0 && k > maxk; --i) {
       while (freq_[i].freq < kMaxHuffCodeLength) {
         ++freq_[i].freq;
         k -= 1 << (kMaxHuffCodeLength - freq_[i].freq);
       }
     }
-    LOGV(2, "k pass1: %.6lf\n", k / double(maxk));
+    LOGV(3, "k pass1: %.6lf\n", k / double(maxk));
     for (int i = 0; i < num_symbols; ++i) {
       while (k + (1 << (kMaxHuffCodeLength - freq_[i].freq)) <= maxk) {
         k += 1 << (kMaxHuffCodeLength - freq_[i].freq);
         --freq_[i].freq;
       }
     }
-    LOGV(2, "k pass2: %x, %x\n", k, maxk);
+    LOGV(3, "k pass2: %x, %x\n", k, maxk);
   }
 
   void buildTable() {
@@ -302,15 +314,12 @@ public:
     writer_.writeBits(code_[symbol], length_[symbol]);
   }
 
-  size_t finish() {
+  int64_t finish() {
     return writer_.finish();
   }
 
 private:
-  uint8_t* buffer_;
   BitWriter writer_;
-  size_t at_ = 0;
-  size_t buf_size_;
 
   Node freq_[512] = {0};
 
@@ -320,11 +329,11 @@ private:
 
 class HuffmanDecoder {
 public:
-  HuffmanDecoder(uint8_t* buffer, uint8_t* end, uint8_t* output, uint8_t* output_end)
-    : br_(buffer, end),
-      output_(output),
-      output_end_(output_end) {
+  HuffmanDecoder(uint8_t* buffer, uint8_t* end)
+    : br_(buffer, end) {
   }
+
+  BitReader& br() { return br_; }
 
   bool readTable() {
     int sym_bits = 8;
@@ -349,6 +358,9 @@ public:
     }
     LOGV(1, "num_sym %d codelen(min:%d, max:%d)\n", num_symbols_, min_codelen_, max_codelen_);
 
+    // Ensure we catch up to be byte aligned.
+    br_.byteAlign();
+
     return true;
   }
 
@@ -371,8 +383,8 @@ public:
     return true;
   }
 
-  bool decode() {
-    uint8_t* src = br_.current() - ((24 - br_.position()) / 8);
+  bool decode(uint8_t* output, uint8_t* output_end) {
+    uint8_t* src = br_.cursor();
     uint8_t* src_end = br_.end();
     int position = 24;
     uint32_t bits = 0;
@@ -384,8 +396,8 @@ public:
       }
       int n = bits >> (32 - max_codelen_);
       int len = bits_to_len_[n];
-      *output_++ = bits_to_sym_[n];
-      if (output_ >= output_end_) {
+      *output++ = bits_to_sym_[n];
+      if (output >= output_end) {
         break;
       }
       bits <<= len;
@@ -394,12 +406,18 @@ public:
     return true;
   }
 
+  uint8_t decodeOne() {
+    br_.refill();
+    int n = br_.bits() >> (32 - max_codelen_);
+    int len = bits_to_len_[n];
+    br_.readBits(len);
+    return bits_to_sym_[n];
+  }
+
   static const int kMaxSymbols = 256;
 
 private:
   BitReader br_;
-  uint8_t* output_;
-  uint8_t* output_end_;
   int num_symbols_;
   int last_used_symbol_;
   int min_codelen_ = 255;
@@ -412,23 +430,23 @@ private:
   uint8_t bits_to_len_[0x800] = {0};
 };
 
-size_t compress(uint8_t* buf, size_t len, uint8_t* out) {
+int64_t huffmanCompress(uint8_t* buf, int64_t len, uint8_t* out) {
   uint8_t* out_start = out;
-  size_t chunk_size = 1 << 18; // 256k
-  for (size_t start = 0; start < len; start += chunk_size) {
-    size_t remaining = std::min(chunk_size, len - start);
+  int64_t chunk_size = 1 << 18; // 256k
+  for (int64_t start = 0; start < len; start += chunk_size) {
+    int64_t remaining = std::min(chunk_size, len - start);
     uint8_t* marker = out;
     out += 3;
 
-    HuffmanEncoder encoder(out, remaining);
-    for (size_t i = 0; i < remaining; ++i) {
+    HuffmanEncoder encoder(out);
+    for (int64_t i = 0; i < remaining; ++i) {
       encoder.scan(buf[i]);
     }
     encoder.buildTable();
-    for (size_t i = 0; i < remaining; ++i) {
+    for (int64_t i = 0; i < remaining; ++i) {
       encoder.encode(buf[i]);
     }
-    size_t chunk_written = encoder.finish();
+    int64_t chunk_written = encoder.finish();
     marker[0] = chunk_written & 0xff;
     marker[1] = (chunk_written >> 8) & 0xff;
     marker[2] = (chunk_written >> 16) & 0xff;
@@ -439,18 +457,18 @@ size_t compress(uint8_t* buf, size_t len, uint8_t* out) {
   return out - out_start;
 }
 
-void decompress(uint8_t* buf, size_t len, uint8_t* out, size_t out_len) {
-  size_t read = 0;
-  size_t chunk_size = 1 << 18; // 256k
+void huffmanDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len) {
+  int64_t read = 0;
+  int64_t chunk_size = 1 << 18; // 256k
   uint8_t* buf_end = buf + len;
   while (buf < buf_end) {
     int compressed_size = buf[0] | (buf[1] << 8) | (buf[2] << 16);
     buf += 3;
 
-    HuffmanDecoder decoder(buf, buf + compressed_size, out, out + std::min(chunk_size, out_len));
+    HuffmanDecoder decoder(buf, buf + compressed_size);
     CHECK(decoder.readTable());
     CHECK(decoder.assignCodes());
-    CHECK(decoder.decode());
+    CHECK(decoder.decode(out, out + std::min(chunk_size, out_len)));
 
     buf += compressed_size;
     out += chunk_size;
@@ -458,7 +476,330 @@ void decompress(uint8_t* buf, size_t len, uint8_t* out, size_t out_len) {
   }
 }
 
-std::unique_ptr<uint8_t> enwik8(size_t& len) {
+// From https://github.com/skeeto/hash-prospector
+uint32_t hash32(uint32_t x) {
+  x ^= x >> 18;
+  x *= uint32_t(0xa136aaad);
+  x ^= x >> 16;
+  x *= uint32_t(0x9f6d62d7);
+  x ^= x >> 17;
+  return x;
+}
+
+class MatchFinder {
+public:
+  MatchFinder(int64_t window_size)
+    : window_size_(window_size),
+      window_mask_(window_size - 1) {
+    ht_.resize(window_size, -window_size);
+    chain_.resize(window_size, -window_size);
+  }
+
+  int matchLength(uint8_t* src, uint8_t* match, uint8_t* end) {
+    int len = 0;
+    while (src + len < end && src[len] == match[len]) {
+      ++len;
+    }
+    return len;
+  }
+
+  void insert(uint8_t* buf, int64_t pos) {
+    int key = hash32(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16)) & window_mask_;
+    chain_[pos & window_mask_] = ht_[key];
+    ht_[key] = pos;
+  }
+
+  int findMatch(uint8_t* buf, uint8_t* buf_end, int64_t pos, int64_t& match_pos) {
+    int best_match_len = 0;
+
+    int key = hash32(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16)) & window_mask_;
+    int64_t next = ht_[key];
+
+    int64_t min_pos = pos - window_size_;
+    while (next > min_pos) {
+      int match_len = matchLength(&buf[pos], &buf[next], buf_end);
+      if (match_len > best_match_len) {
+        best_match_len = match_len;
+        match_pos = next;
+      }
+
+      next = chain_[next & window_mask_];
+    }
+
+    // Insert new match
+    chain_[pos & window_mask_] = ht_[key];
+    ht_[key] = pos;
+
+    return best_match_len;
+  }
+
+private:
+  int64_t window_size_;
+  int64_t window_mask_;
+  std::vector<int> ht_;
+  std::vector<int> chain_;
+};
+
+int literalLengthCode(int literal_length) {
+  if (literal_length <= 15) {
+    return literal_length;
+  }
+  return 12 + log2(literal_length);
+}
+
+int literalLengthExtra(int literal_length) {
+  if (literal_length <= 15) {
+    return 0;
+  }
+  return literal_length - (1 << log2(literal_length));
+}
+
+uint8_t* writeVarint(uint8_t* buf, int v) {
+  while (v > 0x7f) {
+    *buf++ = 0x80 | (v & 0x7f);
+  }
+  *buf++ = v;
+  return buf;
+}
+
+template<int bytes>
+int readInt(uint8_t* buf) {
+  int v = 0;
+  for (int i = 0; i < bytes; ++i) {
+    v |= buf[i] << (i * 8);
+  }
+  return v;
+}
+
+template<int bytes>
+void writeInt(uint8_t* buf, int v) {
+  for (int i = 0; i < bytes; ++i) {
+    *buf++ = v & 0xff;
+    v >>= 8;
+  }
+}
+
+class LzEncoder {
+public:
+  // Initializes encoder with a backwards window of `window_size`.  Must be a power of 2!
+  LzEncoder(int64_t window_size)
+   : matcher_(window_size) {
+  }
+
+  // Compresses `buffer` from `buffer+p` to `buffer+p_end`.
+  // Writes compressed sequence to `out`.  `out` must contain at least `window_size` bytes!
+  // Returns number of bytes written to `out`.
+  int64_t encode(uint8_t* buffer, int64_t p, int64_t p_end, uint8_t* out) {
+    std::vector<int> match_offsets;
+    std::vector<int> match_lengths;
+    std::vector<int> literal_lengths;
+    std::vector<uint8_t> literals;
+
+    uint8_t* out_start = out;
+    int num_literals = 0;
+
+    for (int64_t i = p; i < p_end; ++i) {
+      // Output a match?  Or a literal?
+      int64_t match_pos;
+      int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
+      if (match_len != 0) {
+        match_offsets.push_back(i - match_pos);
+        match_lengths.push_back(match_len);
+        literal_lengths.push_back(num_literals);
+        num_literals = 0;
+
+        // printf("Match cur:%lld, match:%lld len:%d\n", i, match_pos, match_len);
+        /*
+        printf("((");
+        for (int j = 0; j < match_len; ++j) {
+          printf("%c", buffer[i + j]);
+        }
+        printf("))");
+        */
+
+        while (--match_len > 0) {
+          matcher_.insert(buffer, ++i);
+        }
+      } else {
+        literals.push_back(buffer[i]);
+        ++num_literals;
+        // printf("%c", buffer[i]);
+      }
+    }
+    if (num_literals != 0) {
+      literal_lengths.push_back(num_literals);
+      match_offsets.push_back(0);
+      match_lengths.push_back(0);
+    }
+
+    // Write literal section
+    {
+      // Uncompressed length
+      writeInt<3>(out, literals.size());
+      out += 3;
+      // Compressed length
+      uint8_t* marker = out;
+      out += 3;
+
+      // Huffman table for literals
+      HuffmanEncoder encoder(out);
+      for (uint8_t literal : literals) {
+        encoder.scan(literal);
+      }
+      encoder.buildTable();
+      for (uint8_t literal : literals) {
+        encoder.encode(literal);
+      }
+      int64_t bytes_written = encoder.finish();
+      out += bytes_written;
+      writeInt<3>(marker, bytes_written);
+      LOGV(1, "literals: %lu -> %lld\n", literals.size(), bytes_written);
+    }
+
+    // Write sequences section
+    writeInt<3>(out, literal_lengths.size());
+    out += 3;
+
+    /*
+    for (int i = 0; i < literal_lengths.size(); ++i) {
+      LOGV(2, "Encoding (lit_len:%d, match_offset:%d, match_length:%d)\n", literal_lengths[i], match_offsets[i], match_lengths[i]);
+    }
+    */
+
+    // a. Literal lengths
+    int lit_len_out = writeValues(out, literal_lengths);
+    out += lit_len_out;
+    // b. Match offsets
+    int match_offsets_out = writeValues(out, match_offsets);
+    out += match_offsets_out;
+    // c. Match lengths
+    int match_lengths_out = writeValues(out, match_lengths);
+    out += match_lengths_out;
+
+    LOGV(1, "Wrote block, %lu sequences lit_len:%d match_offsets:%d match_lengths:%d\n", literal_lengths.size(), lit_len_out, match_offsets_out, match_lengths_out);
+
+    return out - out_start;
+  }
+
+private:
+  int64_t writeValues(uint8_t* out, const std::vector<int>& values) {
+    HuffmanEncoder encoder(out);
+    for (int v : values) {
+      encoder.scan(literalLengthCode(v));
+    }
+    encoder.buildTable();
+    for (int v : values) {
+      encoder.encode(literalLengthCode(v));
+      LOGV(3, "Encoding %d -> %d (%d, %d)\n", v, literalLengthCode(v), log2(v), literalLengthExtra(v));
+      if (v >= 16) {
+        int extra = literalLengthExtra(v);
+        encoder.writer().writeBits(extra, log2(v));
+      }
+    }
+    return encoder.finish();
+  }
+
+  MatchFinder matcher_;
+};
+
+class LzDecoder {
+public:
+  bool decode(uint8_t* buf, uint8_t* end, uint8_t* out, uint8_t* out_end) {
+    uint8_t literals[1 << 18];
+    int literal_lengths[1 << 16];
+    int match_offsets[1 << 16];
+    int match_lengths[1 << 16];
+
+    {
+      int num_literals = readInt<3>(buf);
+      int compressed_size = readInt<3>(buf + 3);
+      buf += 6;
+      LOGV(1, "Read %d literals, %d compressed bytes\n", num_literals, compressed_size);
+
+      HuffmanDecoder decoder(buf, buf + compressed_size);
+      CHECK(decoder.readTable());
+      CHECK(decoder.assignCodes());
+      CHECK(decoder.decode(literals, literals + num_literals));
+      buf += compressed_size;
+    }
+
+    int num_seq = readInt<3>(buf);
+    buf += 3;
+    LOGV(1, "Read %d sequences\n", num_seq);
+
+    buf += decodeValues(buf, end, num_seq, literal_lengths);
+    buf += decodeValues(buf, end, num_seq, match_offsets);
+    buf += decodeValues(buf, end, num_seq, match_lengths);
+
+    uint8_t* l_head = literals;
+    for (int i = 0; i < num_seq; ++i) {
+      LOGV(2, "Sequence (lit_len:%d, match_offset:%d, match_length:%d)\n", literal_lengths[i], match_offsets[i], match_lengths[i]);
+      for (int j = 0; j < literal_lengths[i]; ++j) {
+        *out++ = *l_head++;
+      }
+      uint8_t* match_base = out - match_offsets[i];
+      for (int j = 0; j < match_lengths[i]; ++j) {
+        *out++ = match_base[j];
+      }
+    }
+    return true;
+  }
+
+private:
+  int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
+    HuffmanDecoder decoder(buf, end);
+    CHECK(decoder.readTable());
+    CHECK(decoder.assignCodes());
+    for (int i = 0; i < num_seq; ++i) {
+      int v = decoder.decodeOne();
+      if (v >= 16) {
+        int extra_bits = v - 12;
+        v = 1 << extra_bits;
+        v |= decoder.br().readBits(extra_bits);
+      }
+      values[i] = v;
+    }
+    decoder.br().byteAlign();
+    return decoder.br().cursor() - buf;
+  }
+};
+
+int64_t lzCompress(uint8_t* buf, int64_t len, uint8_t* out) {
+  uint8_t* out_start = out;
+  int64_t chunk_size = 1 << 18; // 256k
+  LzEncoder lz_encoder(chunk_size);
+
+  for (int64_t start = 0; start < len; start += chunk_size) {
+    int64_t remaining = std::min(chunk_size, len - start);
+    uint8_t* marker = out;
+    out += 3;
+
+    int64_t chunk_written = lz_encoder.encode(buf, start, start + remaining, out);
+    writeInt<3>(marker, chunk_written);
+
+    out += chunk_written;
+  }
+  return out - out_start;
+}
+
+void lzDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len) {
+  int64_t read = 0;
+  int64_t chunk_size = 1 << 18; // 256k
+  uint8_t* buf_end = buf + len;
+  LzDecoder decoder;
+  while (buf < buf_end) {
+    int compressed_size = readInt<3>(buf);
+    buf += 3;
+
+    CHECK(decoder.decode(buf, buf + compressed_size, out, out + std::min(chunk_size, out_len)));
+
+    buf += compressed_size;
+    out += chunk_size;
+    out_len -= chunk_size;
+  }
+}
+
+std::unique_ptr<uint8_t> readEnwik8(int64_t& len) {
   FILE* f = fopen("enwik8", "r");
   fseek(f, 0, SEEK_END);
   len = ftell(f);
@@ -470,21 +811,21 @@ std::unique_ptr<uint8_t> enwik8(size_t& len) {
   return std::move(buf);
 }
 
-int testBitReader(uint8_t* buf, uint8_t* out, size_t len) {
+int testBitReader(uint8_t* buf, uint8_t* out, int64_t len) {
   BitReader orig_reader(buf, buf + len);
   BitWriter writer(out);
-  for (size_t i = 0; i < 8 * len; ++i) {
+  for (int64_t i = 0; i < 8 * len; ++i) {
     orig_reader.refill();
     writer.writeBit(orig_reader.readBit());
   }
 
   BitReader reader(out, out + len);
-  for (size_t i = 0; i < len; ++i) {
+  for (int64_t i = 0; i < len; ++i) {
     reader.refill();
     uint8_t orig = buf[i];
     uint8_t written = reader.readBits(8);
     if (orig != written) {
-      fprintf(stderr, "busted %ld,%d,%d\n", i, orig, written);
+      fprintf(stderr, "busted %lld,%d,%d\n", i, orig, written);
       return 1;
     }
   }
@@ -492,61 +833,58 @@ int testBitReader(uint8_t* buf, uint8_t* out, size_t len) {
   return 0;
 }
 
-bool testHuffman(uint8_t* buf, uint8_t* out, size_t len) {
-  HuffmanEncoder encoder(out, len);
-  for (size_t i = 0; i < len; ++i) {
-    encoder.scan(buf[i]);
-  }
-  encoder.buildTable();
-  for (size_t i = 0; i < len; ++i) {
-    encoder.encode(buf[i]);
-  }
-  size_t encoded_size = encoder.finish();
-  // printf("Encoded %zu into %zu bytes\n", len, encoded_size);
-
-  std::unique_ptr<uint8_t> decoded;
-  decoded.reset(new uint8_t[len]);
-  HuffmanDecoder decoder(out, out + encoded_size, decoded.get(), decoded.get() + len);
-  CHECK(decoder.readTable());
-  CHECK(decoder.assignCodes());
-  CHECK(decoder.decode());
-
+int checkBytes(uint8_t* buf, uint8_t* actual, int64_t len) {
   int bad = 0;
-  for (size_t i = 0; i < len; ++i) {
-    uint8_t orig = buf[i];
-    uint8_t v = decoded.get()[i];
+  for (int64_t i = 0; i < len; ++i) {
+    uint8_t orig = actual[i];
+    uint8_t v = buf[i];
     if (orig != v) {
       if (++bad > 20) {
         fprintf(stderr, "more than 20 busted\n");
         break;
       }
-      fprintf(stderr, "busted_huff idx:%ld,orig:%d,decoded:%d\n", i, orig, v);
+      fprintf(stderr, "bad idx:%lld,orig:%d,decoded:%d\n", i, orig, v);
     }
   }
-
-  return bad == 0;
+  return bad;
 }
 
-int main() {
-  size_t len;
+bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
+  HuffmanEncoder encoder(out);
+  for (int64_t i = 0; i < len; ++i) {
+    encoder.scan(buf[i]);
+  }
+  encoder.buildTable();
+  for (int64_t i = 0; i < len; ++i) {
+    encoder.encode(buf[i]);
+  }
+  int64_t encoded_size = encoder.finish();
+  // printf("Encoded %zu into %zu bytes\n", len, encoded_size);
+
+  std::unique_ptr<uint8_t> decoded;
+  decoded.reset(new uint8_t[len]);
+  HuffmanDecoder decoder(out, out + encoded_size);
+  CHECK(decoder.readTable());
+  CHECK(decoder.assignCodes());
+  CHECK(decoder.decode(decoded.get(), decoded.get() + len));
+
+  return checkBytes(decoded.get(), buf, len) == 0;
+}
+
+/*
+void huffmanSpeed() {
+  int64_t len;
   std::unique_ptr<uint8_t> buf = enwik8(len);
-  printf("Read %ld bytes\n", len);
+  printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
 
-  /*
-  testBitReader(buf.get(), out.get(), 1000);
-  for (int i = 1; i < 1000; i += 50) {
-    CHECK(testHuffman(buf.get(), out.get(), i));
-  }
-  */
-
-  size_t encoded_size;
+  int64_t encoded_size;
   {
     Timer timer;
-    encoded_size = compress(buf.get(), len, out.get());
+    encoded_size = huffmanCompress(buf.get(), len, out.get());
     double elapsed = timer.elapsed() / 1000;
-    printf("Encoded %zu into %zu bytes\n", len, encoded_size);
+    printf("Encoded %lld into %lld bytes\n", len, encoded_size);
     printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
   }
 
@@ -564,6 +902,48 @@ int main() {
     }
     printf("Decompression validated!\n");
   }
+}
+*/
+
+void testLz() {
+  int64_t len;
+  std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
+  len = 100000000;
+  printf("Read %lld bytes\n", len);
+  std::unique_ptr<uint8_t> out;
+  out.reset(new uint8_t[len]);
+
+  //std::string test = "ABABABABCAAAABBBBABC";
+  //test = test + test + test + test + test;
+  //std::string test = "ABCDEFGHIJKLMNOPQRS";
+  //len = test.size();
+  //uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
+  uint8_t* buf = enwik8.get();
+  int64_t encoded_size = lzCompress(buf, len, out.get());
+  printf("Encoded %lld into %lld bytes\n", len, encoded_size);
+
+  std::unique_ptr<uint8_t> decoded;
+  decoded.reset(new uint8_t[len]);
+  lzDecompress(out.get(), encoded_size, decoded.get(), len);
+
+  checkBytes(decoded.get(), buf, len);
+}
+
+int main() {
+  /*
+  int64_t len;
+  std::unique_ptr<uint8_t> buf = enwik8(len);
+  printf("Read %lld bytes\n", len);
+  std::unique_ptr<uint8_t> out;
+  out.reset(new uint8_t[len]);
+
+  testBitReader(buf.get(), out.get(), 1000);
+  for (int i = 1; i < 1000; i += 50) {
+    CHECK(testHuffman(buf.get(), out.get(), i));
+  }
+  */
+
+  testLz();
 
   return 0;
 }
