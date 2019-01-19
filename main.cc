@@ -282,26 +282,6 @@ public:
     walk(n->r, level + 1);
   }
 
-  void buildOptimalLengthLimitedTable() {
-    // Compress to just the used symbols
-    int num_symbols = 0;
-    for (int i = 0; i < 256; ++i) {
-      if (freq_[i].freq != 0) {
-        freq_[num_symbols++] = freq_[i];
-      }
-    }
-    std::sort(&freq_[0], &freq_[num_symbols], [](const Node& l, const Node& r){return l.freq < r.freq;});
-    uint16_t coins[256];
-
-    for (int i = 0; i < num_symbols; ++i) {
-      coins[i] = 0x7ff;
-    }
-
-    // TODO
-
-    writeTable(num_symbols);
-  }
-
   void encode(int symbol) {
     writer_.writeBits(code_[symbol], length_[symbol]);
   }
