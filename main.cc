@@ -76,20 +76,12 @@ public:
     }
   }
 
-  uint8_t* current() const {
-    return current_;
-  }
-
   uint8_t* end() const {
     return end_;
   }
 
   uint32_t bits() const {
     return bits_;
-  }
-
-  int position() const {
-    return position_;
   }
 
   // Actual location we have read up to in the byte stream.
@@ -142,8 +134,8 @@ public:
 private:
   void flush() {
     while (position_ >= 8) {
-      *current_ = (bits_ >> (position_ - 8)) & 0xFF;
       position_ -= 8;
+      *current_ = (bits_ >> position_) & 0xFF;
       ++current_;
     }
   }
@@ -496,7 +488,16 @@ public:
   }
 
   int matchLength(uint8_t* src, uint8_t* match, uint8_t* end) {
-    int len = 0;
+    // Do a fast match against the first 4 bytes.  Note that this
+    // excludes matches with length less than 4, but matches that
+    // small are not a good use of bits.
+    uint32_t* s32 = reinterpret_cast<uint32_t*>(src);
+    uint32_t* m32 = reinterpret_cast<uint32_t*>(match);
+    if (*s32 != *m32) {
+      return 0;
+    }
+
+    int len = 4;
     while (src + len < end && src[len] == match[len]) {
       ++len;
     }
@@ -516,9 +517,14 @@ public:
     int64_t next = ht_[key];
 
     int64_t min_pos = pos - window_size_;
-    while (next > min_pos) {
+    int hits = 0;
+    // Limit the number of hash buckets we search, otherwise the search can blow up
+    // for larger window sizes.
+    const int kNumHits = 16;
+    const int kMinLength = 4;
+    while (next > min_pos && ++hits < kNumHits) {
       int match_len = matchLength(&buf[pos], &buf[next], buf_end);
-      if (match_len > best_match_len) {
+      if (match_len > best_match_len && match_len > kMinLength) {
         best_match_len = match_len;
         match_pos = next;
       }
@@ -908,7 +914,7 @@ void huffmanSpeed() {
 void testLz() {
   int64_t len;
   std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
-  len = 100000000;
+  // len = 10000000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -919,12 +925,18 @@ void testLz() {
   //len = test.size();
   //uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
   uint8_t* buf = enwik8.get();
+  Timer timer;
   int64_t encoded_size = lzCompress(buf, len, out.get());
   printf("Encoded %lld into %lld bytes\n", len, encoded_size);
+  double elapsed = timer.elapsed() / 1000;
+  printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
 
   std::unique_ptr<uint8_t> decoded;
   decoded.reset(new uint8_t[len]);
+  timer = Timer();
   lzDecompress(out.get(), encoded_size, decoded.get(), len);
+  elapsed = timer.elapsed() / 1000;
+  printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
 
   checkBytes(decoded.get(), buf, len);
 }
