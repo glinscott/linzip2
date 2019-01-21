@@ -170,6 +170,7 @@ public:
       max_symbols_(max_symbols) {
     for (int i = 0; i < max_symbols_; ++i) {
       nodes_[i].symbol = i;
+      nodes_[i].freq = 0;
     }
   }
 
@@ -297,10 +298,10 @@ private:
   BitWriter writer_;
   int max_symbols_;
 
-  Node nodes_[512] = {0};
+  Node nodes_[512];
 
-  uint8_t length_[256] = {0};
-  int code_[256] = {0};
+  uint8_t length_[256];
+  int code_[256];
 };
 
 class HuffmanDecoder {
