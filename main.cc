@@ -181,35 +181,38 @@ public:
   }
 
   void buildTable() {
-    int idx = max_symbols_;
-
-    std::priority_queue<Node*, std::vector<Node*>, Comparator> q;
-
-    // Coalesce used symbols
+    // Coalesce used symbols, and add to heap
+    Node* q[256];
     int num_symbols = 0;
     for (int i = 0; i < max_symbols_; ++i) {
       if (nodes_[i].freq) {
         nodes_[num_symbols] = nodes_[i];
-        q.push(&nodes_[num_symbols]);
+        q[num_symbols] = &nodes_[num_symbols];
         ++num_symbols;
       }
     }
 
-    // Build Huffman tree
-    while (q.size() > 1) {
-      Node* n1 = q.top(); q.pop();
-      Node* n2 = q.top(); q.pop();
+    Comparator c;
+    std::make_heap(&q[0], &q[num_symbols], c);
 
-      Node* add = &nodes_[idx++];
-      add->freq = n1->freq + n2->freq;
-      add->symbol = -1;
-      add->l = n2;
-      add->r = n1;
-      q.push(add);
+    // Build Huffman tree
+    for (int i = num_symbols; i > 1; --i) {
+      Node* n1 = q[0];
+      std::pop_heap(&q[0], &q[i], c);
+      Node* n2 = q[0];
+      std::pop_heap(&q[0], &q[i-1], c);
+
+      Node* parent = &nodes_[num_symbols+i];
+      parent->freq = n1->freq + n2->freq;
+      parent->symbol = -1;
+      parent->l = n2;
+      parent->r = n1;
+      q[i-2] = parent;
+      std::push_heap(&q[0], &q[i-1], c);
     }
 
     // Label the distances from the root for the leafs
-    walk(q.top(), num_symbols == 1 ? 1 : 0);
+    walk(q[0], num_symbols == 1 ? 1 : 0);
 
     // Sort leaf nodes into level order.  This is required
     // for both length limiting and writing the table.
@@ -929,6 +932,16 @@ void testLz() {
   checkBytes(decoded.get(), buf, len);
 }
 
+void testShort() {
+  std::string test = "AAAAABCCC";
+  int64_t len = test.size();
+  uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
+  std::unique_ptr<uint8_t> out;
+  out.reset(new uint8_t[100+len]);
+  int64_t encoded_size = huffmanCompress(buf, len, out.get());
+  printf("Encoded into %lld\n", encoded_size);
+}
+
 int main() {
   /*
   int64_t len;
@@ -943,6 +956,8 @@ int main() {
   }
   huffmanSpeed();
   */
+
+  //testShort();
 
   testLz();
 
