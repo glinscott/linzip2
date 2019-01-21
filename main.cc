@@ -165,26 +165,76 @@ private:
   };
 
 public:
-  HuffmanEncoder(uint8_t* buffer)
-    : writer_(buffer) {
-    for (int i = 0; i < 256; ++i) {
-      freq_[i].symbol = i;
+  HuffmanEncoder(uint8_t* buffer, int max_symbols = 256)
+    : writer_(buffer),
+      max_symbols_(max_symbols) {
+    for (int i = 0; i < max_symbols_; ++i) {
+      nodes_[i].symbol = i;
     }
   }
 
   BitWriter& writer() { return writer_; }
 
   void scan(int symbol) {
-    ++freq_[symbol].freq;
+    ++nodes_[symbol].freq;
   }
 
+  void buildTable() {
+    int idx = max_symbols_;
+
+    std::priority_queue<Node*, std::vector<Node*>, Comparator> q;
+
+    // Coalesce used symbols
+    int num_symbols = 0;
+    for (int i = 0; i < max_symbols_; ++i) {
+      if (nodes_[i].freq) {
+        nodes_[num_symbols] = nodes_[i];
+        q.push(&nodes_[num_symbols]);
+        ++num_symbols;
+      }
+    }
+
+    // Build Huffman tree
+    while (q.size() > 1) {
+      Node* n1 = q.top(); q.pop();
+      Node* n2 = q.top(); q.pop();
+
+      Node* add = &nodes_[idx++];
+      add->freq = n1->freq + n2->freq;
+      add->symbol = -1;
+      add->l = n2;
+      add->r = n1;
+      q.push(add);
+    }
+
+    // Label the distances from the root for the leafs
+    walk(q.top(), num_symbols == 1 ? 1 : 0);
+
+    // Sort leaf nodes into level order.  This is required
+    // for both length limiting and writing the table.
+    std::sort(&nodes_[0], &nodes_[num_symbols], [](const Node& l, const Node& r){return l.freq < r.freq;});
+
+    limitLength(num_symbols);
+    writeTable(num_symbols);
+  }
+
+  void encode(int symbol) {
+    writer_.writeBits(code_[symbol], length_[symbol]);
+  }
+
+  int64_t finish() {
+    return writer_.finish();
+  }
+
+private:
   void writeTable(int num_symbols) {
-    writer_.writeBits(num_symbols, 8);
+    const int kSymBits = log2(max_symbols_);
+    writer_.writeBits(num_symbols, kSymBits);
 
     int code = 0;
     int last_level = -1;
     for (int i = 0; i < num_symbols; ++i) {
-      int level = freq_[i].freq;
+      int level = nodes_[i].freq;
       if (last_level != level) {
         if (last_level != -1) {
           ++code;
@@ -195,11 +245,11 @@ public:
         ++code;
       }
 
-      int symbol = freq_[i].symbol;
+      int symbol = nodes_[i].symbol;
       length_[symbol] = level;
       code_[symbol] = code;
 
-      writer_.writeBits(freq_[i].symbol, 8);
+      writer_.writeBits(nodes_[i].symbol, kSymBits);
       writer_.writeBits(level - 1, 4);
 
       LOGV(2, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
@@ -214,62 +264,24 @@ public:
     int k = 0;
     int maxk = (1 << kMaxHuffCodeLength) - 1;
     for (int i = num_symbols - 1; i >= 0; --i) {
-      freq_[i].freq = std::min(freq_[i].freq, 11);
-      k += 1 << (kMaxHuffCodeLength - freq_[i].freq);
+      nodes_[i].freq = std::min(nodes_[i].freq, 11);
+      k += 1 << (kMaxHuffCodeLength - nodes_[i].freq);
     }
     LOGV(3, "k before: %.6lf\n", k / double(maxk));
     for (int i = num_symbols - 1; i >= 0 && k > maxk; --i) {
-      while (freq_[i].freq < kMaxHuffCodeLength) {
-        ++freq_[i].freq;
-        k -= 1 << (kMaxHuffCodeLength - freq_[i].freq);
+      while (nodes_[i].freq < kMaxHuffCodeLength) {
+        ++nodes_[i].freq;
+        k -= 1 << (kMaxHuffCodeLength - nodes_[i].freq);
       }
     }
     LOGV(3, "k pass1: %.6lf\n", k / double(maxk));
     for (int i = 0; i < num_symbols; ++i) {
-      while (k + (1 << (kMaxHuffCodeLength - freq_[i].freq)) <= maxk) {
-        k += 1 << (kMaxHuffCodeLength - freq_[i].freq);
-        --freq_[i].freq;
+      while (k + (1 << (kMaxHuffCodeLength - nodes_[i].freq)) <= maxk) {
+        k += 1 << (kMaxHuffCodeLength - nodes_[i].freq);
+        --nodes_[i].freq;
       }
     }
     LOGV(3, "k pass2: %x, %x\n", k, maxk);
-  }
-
-  void buildTable() {
-    int idx = 256;
-
-    std::priority_queue<Node*, std::vector<Node*>, Comparator> q;
-    const int kSentinel = 9999;
-    int num_symbols = 0;
-    for (int i = 0; i < 256; ++i) {
-      if (freq_[i].freq) {
-        q.push(&freq_[i]);
-        ++num_symbols;
-      } else {
-        freq_[i].freq = kSentinel;
-      }
-    }
-
-    while (q.size() > 1) {
-      Node* n1 = q.top();
-      q.pop();
-      Node* n2 = q.top();
-      q.pop();
-
-      Node* add = &freq_[idx++];
-      add->symbol = -1;
-      add->l = n2;
-      add->r = n1;
-      add->freq = n1->freq + n2->freq;
-      q.push(add);
-    }
-
-    walk(q.top(), num_symbols == 1 ? 1 : 0);
-
-    // TODO: Not efficient...
-    std::sort(&freq_[0], &freq_[256], [](const Node& l, const Node& r){return l.freq < r.freq;});
-
-    limitLength(num_symbols);
-    writeTable(num_symbols);
   }
 
   void walk(Node* n, int level) {
@@ -282,18 +294,10 @@ public:
     walk(n->r, level + 1);
   }
 
-  void encode(int symbol) {
-    writer_.writeBits(code_[symbol], length_[symbol]);
-  }
-
-  int64_t finish() {
-    return writer_.finish();
-  }
-
-private:
   BitWriter writer_;
+  int max_symbols_;
 
-  Node freq_[512] = {0};
+  Node nodes_[512] = {0};
 
   uint8_t length_[256] = {0};
   int code_[256] = {0};
@@ -301,23 +305,22 @@ private:
 
 class HuffmanDecoder {
 public:
-  HuffmanDecoder(uint8_t* buffer, uint8_t* end)
-    : br_(buffer, end) {
+  HuffmanDecoder(uint8_t* buffer, uint8_t* end, int sym_bits = 8)
+    : br_(buffer, end),
+      sym_bits_(sym_bits) {
   }
 
   BitReader& br() { return br_; }
 
   bool readTable() {
-    int sym_bits = 8;
-
     br_.refill();
-    num_symbols_ = br_.readBits(sym_bits);
+    num_symbols_ = br_.readBits(sym_bits_);
 
     CHECK(num_symbols_ <= kMaxSymbols);
 
     for (int i = 0; i < num_symbols_; ++i) {
       br_.refill();
-      int symbol = br_.readBits(sym_bits);
+      int symbol = br_.readBits(sym_bits_);
       int codelen = br_.readBits(4) + 1;
       LOGV(2, "sym:%d len:%d\n", symbol, codelen);
 
@@ -390,6 +393,7 @@ public:
 
 private:
   BitReader br_;
+  int sym_bits_;
   int num_symbols_;
   int last_used_symbol_;
   int min_codelen_ = 255;
@@ -669,7 +673,7 @@ public:
 
 private:
   int64_t writeValues(uint8_t* out, const std::vector<int>& values) {
-    HuffmanEncoder encoder(out);
+    HuffmanEncoder encoder(out, 32);
     for (int v : values) {
       encoder.scan(literalLengthCode(v));
     }
@@ -733,7 +737,8 @@ public:
 
 private:
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
-    HuffmanDecoder decoder(buf, end);
+    const int kSymBits = 5;
+    HuffmanDecoder decoder(buf, end, kSymBits);
     CHECK(decoder.readTable());
     CHECK(decoder.assignCodes());
     for (int i = 0; i < num_seq; ++i) {
@@ -857,10 +862,10 @@ bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
   return checkBytes(decoded.get(), buf, len) == 0;
 }
 
-/*
 void huffmanSpeed() {
   int64_t len;
-  std::unique_ptr<uint8_t> buf = enwik8(len);
+  std::unique_ptr<uint8_t> buf = readEnwik8(len);
+  len = 10000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -868,33 +873,35 @@ void huffmanSpeed() {
   int64_t encoded_size;
   {
     Timer timer;
-    encoded_size = huffmanCompress(buf.get(), len, out.get());
+    const int kIters = 10000;
+    for (int i = 0; i < kIters; ++i) {
+      encoded_size = huffmanCompress(buf.get(), len, out.get());
+    }
     double elapsed = timer.elapsed() / 1000;
     printf("Encoded %lld into %lld bytes\n", len, encoded_size);
-    printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
+    printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len * kIters / (1024. * 1024.)) / elapsed);
   }
 
   {
     Timer timer;
-    decompress(out.get(), encoded_size, buf.get(), len);
+    huffmanDecompress(out.get(), encoded_size, buf.get(), len);
     double elapsed = timer.elapsed() / 1000;
     printf("Decompression\n");
     printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
   }
   {
-    std::unique_ptr<uint8_t> truth = enwik8(len);
+    std::unique_ptr<uint8_t> truth = readEnwik8(len);
     for (int i = 0; i < len; ++i) {
       CHECK(truth.get()[i] == buf.get()[i]);
     }
     printf("Decompression validated!\n");
   }
 }
-*/
 
 void testLz() {
   int64_t len;
   std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
-  // len = 10000000;
+  len = 10000000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -924,7 +931,7 @@ void testLz() {
 int main() {
   /*
   int64_t len;
-  std::unique_ptr<uint8_t> buf = enwik8(len);
+  std::unique_ptr<uint8_t> buf = readEnwik8(len);
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -933,6 +940,7 @@ int main() {
   for (int i = 1; i < 1000; i += 50) {
     CHECK(testHuffman(buf.get(), out.get(), i));
   }
+  huffmanSpeed();
   */
 
   testLz();
