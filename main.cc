@@ -273,7 +273,7 @@ private:
     int k = 0;
     int maxk = (1 << kMaxHuffCodeLength) - 1;
     for (int i = num_symbols - 1; i >= 0; --i) {
-      nodes_[i].freq = std::min(nodes_[i].freq, 11);
+      nodes_[i].freq = std::min(nodes_[i].freq, kMaxHuffCodeLength);
       k += 1 << (kMaxHuffCodeLength - nodes_[i].freq);
     }
     LOGV(3, "k before: %.6lf\n", k / double(maxk));
@@ -334,7 +334,6 @@ public:
       LOGV(2, "sym:%d len:%d\n", symbol, codelen);
 
       ++codelen_count_[codelen];
-      last_used_symbol_ = symbol;
       symbol_length_[i] = codelen;
       symbol_[i] = symbol;
       min_codelen_ = std::min(min_codelen_, codelen);
@@ -404,7 +403,6 @@ private:
   BitReader br_;
   int sym_bits_;
   int num_symbols_;
-  int last_used_symbol_;
   int min_codelen_ = 255;
   int max_codelen_ = 0;
   int codelen_count_[17] = {0};
@@ -850,6 +848,7 @@ int checkBytes(uint8_t* buf, uint8_t* actual, int64_t len) {
 }
 
 bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
+  Timer timer;
   HuffmanEncoder encoder(out);
   for (int64_t i = 0; i < len; ++i) {
     encoder.scan(buf[i]);
@@ -859,7 +858,9 @@ bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
     encoder.encode(buf[i]);
   }
   int64_t encoded_size = encoder.finish();
-  // printf("Encoded %zu into %zu bytes\n", len, encoded_size);
+  printf("Encoded %lld into %lld bytes\n", len, encoded_size);
+  double elapsed = timer.elapsed() / 1000;
+  printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
 
   std::unique_ptr<uint8_t> decoded;
   decoded.reset(new uint8_t[len]);
@@ -961,10 +962,10 @@ int main() {
   }
   */
 
-  // huffmanSpeed();
+  huffmanSpeed();
   // testShort();
 
-  testLz();
+  //testLz();
 
   return 0;
 }
