@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
-#include <queue>
 #include <string>
 #include <vector>
 
@@ -220,6 +219,7 @@ public:
 
     limitLength(num_symbols);
     writeTable(num_symbols);
+    buildCodes(num_symbols);
   }
 
   void encode(int symbol) {
@@ -235,9 +235,20 @@ private:
     const int kSymBits = log2(max_symbols_);
     writer_.writeBits(num_symbols, kSymBits);
 
+    for (int i = 0; i < num_symbols; ++i) {
+      writer_.writeBits(nodes_[i].symbol, kSymBits);
+      writer_.writeBits(nodes_[i].freq - 1, 4);
+    }
+
+    // Byte align after the table
+    writer_.finish();
+  }
+
+  void buildCodes(int num_symbols) {
     int code = 0;
     int last_level = -1;
     for (int i = 0; i < num_symbols; ++i) {
+      // Build the binary representation.
       int level = nodes_[i].freq;
       if (last_level != level) {
         if (last_level != -1) {
@@ -253,14 +264,8 @@ private:
       length_[symbol] = level;
       code_[symbol] = code;
 
-      writer_.writeBits(nodes_[i].symbol, kSymBits);
-      writer_.writeBits(level - 1, 4);
-
       LOGV(2, "code:%s hex:%x level:%d symbol:%d\n", toBinary(code, level).c_str(), code, level, symbol);
     }
-
-    // Byte align after the table
-    writer_.finish();
   }
 
   void limitLength(int num_symbols) {
@@ -869,7 +874,7 @@ bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
 void huffmanSpeed() {
   int64_t len;
   std::unique_ptr<uint8_t> buf = readEnwik8(len);
-  len = 10000;
+  // len = 10000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -877,7 +882,7 @@ void huffmanSpeed() {
   int64_t encoded_size;
   {
     Timer timer;
-    const int kIters = 10000;
+    const int kIters = 1;
     for (int i = 0; i < kIters; ++i) {
       encoded_size = huffmanCompress(buf.get(), len, out.get());
     }
@@ -933,7 +938,7 @@ void testLz() {
 }
 
 void testShort() {
-  std::string test = "AAAAABCCC";
+  std::string test = "AAAAAAAABBBBBBBCCCCD";
   int64_t len = test.size();
   uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
   std::unique_ptr<uint8_t> out;
@@ -954,10 +959,10 @@ int main() {
   for (int i = 1; i < 1000; i += 50) {
     CHECK(testHuffman(buf.get(), out.get(), i));
   }
-  huffmanSpeed();
   */
 
-  //testShort();
+  // huffmanSpeed();
+  // testShort();
 
   testLz();
 
