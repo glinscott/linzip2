@@ -32,7 +32,7 @@ struct ChunkHeader {
 
 int log2(int v) {
   if (v > 0) {
-    return 32 - __builtin_clz(v) - 1;
+    return 31 - __builtin_clz(v);
   } else {
     return 0;
   }
@@ -321,7 +321,7 @@ public:
 
   BitReader& br() { return br_; }
 
-  bool readTable() {
+  void readTable() {
     br_.refill();
     num_symbols_ = br_.readBits(sym_bits_);
 
@@ -334,7 +334,6 @@ public:
       LOGV(2, "sym:%d len:%d\n", symbol, codelen);
 
       ++codelen_count_[codelen];
-      symbol_length_[i] = codelen;
       symbol_[i] = symbol;
       min_codelen_ = std::min(min_codelen_, codelen);
       max_codelen_ = std::max(max_codelen_, codelen);
@@ -344,29 +343,10 @@ public:
     // Ensure we catch up to be byte aligned.
     br_.byteAlign();
 
-    return true;
+    assignCodes();
   }
 
-  bool assignCodes() {
-    int p = 0;
-    uint8_t* cursym = &symbol_[0];
-    for (int i = min_codelen_; i <= max_codelen_; ++i) {
-      int n = codelen_count_[i];
-      if (n) {
-        int shift = max_codelen_ - i;
-        memset(bits_to_len_ + p, i, n << shift);
-        int m = 1 << shift;
-        do {
-          memset(bits_to_sym_ + p, *cursym++, m);
-          p += m;
-        } while(--n);
-      }
-    }
-
-    return true;
-  }
-
-  bool decode(uint8_t* output, uint8_t* output_end) {
+  void decode(uint8_t* output, uint8_t* output_end) {
     uint8_t* src = br_.cursor();
     uint8_t* src_end = br_.end();
     int position = 24;
@@ -386,7 +366,6 @@ public:
       bits <<= len;
       position += len;
     }
-    return true;
   }
 
   uint8_t decodeOne() {
@@ -400,17 +379,33 @@ public:
   static const int kMaxSymbols = 256;
 
 private:
+  void assignCodes() {
+    int p = 0;
+    uint8_t* cursym = &symbol_[0];
+    for (int i = min_codelen_; i <= max_codelen_; ++i) {
+      int n = codelen_count_[i];
+      if (n) {
+        int shift = max_codelen_ - i;
+        memset(bits_to_len_ + p, i, n << shift);
+        int m = 1 << shift;
+        do {
+          memset(bits_to_sym_ + p, *cursym++, m);
+          p += m;
+        } while(--n);
+      }
+    }
+  }
+
   BitReader br_;
   int sym_bits_;
   int num_symbols_;
   int min_codelen_ = 255;
   int max_codelen_ = 0;
   int codelen_count_[17] = {0};
-  uint8_t symbol_length_[kMaxSymbols] = {0}; 
 
-  uint8_t symbol_[256] = {0};
-  uint8_t bits_to_sym_[0x800] = {0};
-  uint8_t bits_to_len_[0x800] = {0};
+  uint8_t symbol_[256];
+  uint8_t bits_to_sym_[0x800];
+  uint8_t bits_to_len_[0x800];
 };
 
 int64_t huffmanCompress(uint8_t* buf, int64_t len, uint8_t* out) {
@@ -449,9 +444,8 @@ void huffmanDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len)
     buf += 3;
 
     HuffmanDecoder decoder(buf, buf + compressed_size);
-    CHECK(decoder.readTable());
-    CHECK(decoder.assignCodes());
-    CHECK(decoder.decode(out, out + std::min(chunk_size, out_len)));
+    decoder.readTable();
+    decoder.decode(out, out + std::min(chunk_size, out_len));
 
     buf += compressed_size;
     out += chunk_size;
@@ -714,9 +708,8 @@ public:
       LOGV(1, "Read %d literals, %d compressed bytes\n", num_literals, compressed_size);
 
       HuffmanDecoder decoder(buf, buf + compressed_size);
-      CHECK(decoder.readTable());
-      CHECK(decoder.assignCodes());
-      CHECK(decoder.decode(literals, literals + num_literals));
+      decoder.readTable();
+      decoder.decode(literals, literals + num_literals);
       buf += compressed_size;
     }
 
@@ -746,8 +739,7 @@ private:
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
     const int kSymBits = 5;
     HuffmanDecoder decoder(buf, end, kSymBits);
-    CHECK(decoder.readTable());
-    CHECK(decoder.assignCodes());
+    decoder.readTable();
     for (int i = 0; i < num_seq; ++i) {
       int v = decoder.decodeOne();
       if (v >= 16) {
@@ -858,16 +850,15 @@ bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
     encoder.encode(buf[i]);
   }
   int64_t encoded_size = encoder.finish();
-  printf("Encoded %lld into %lld bytes\n", len, encoded_size);
-  double elapsed = timer.elapsed() / 1000;
-  printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
+  // printf("Encoded %lld into %lld bytes\n", len, encoded_size);
+  // double elapsed = timer.elapsed() / 1000;
+  // printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
 
   std::unique_ptr<uint8_t> decoded;
   decoded.reset(new uint8_t[len]);
   HuffmanDecoder decoder(out, out + encoded_size);
-  CHECK(decoder.readTable());
-  CHECK(decoder.assignCodes());
-  CHECK(decoder.decode(decoded.get(), decoded.get() + len));
+  decoder.readTable();
+  decoder.decode(decoded.get(), decoded.get() + len);
 
   return checkBytes(decoded.get(), buf, len) == 0;
 }
@@ -962,10 +953,10 @@ int main() {
   }
   */
 
-  huffmanSpeed();
+  //huffmanSpeed();
   // testShort();
 
-  //testLz();
+  testLz();
 
   return 0;
 }
