@@ -26,10 +26,6 @@ std::string toBinary(int v, int size) {
   return result;
 }
 
-struct ChunkHeader {
-  uint8_t flags;
-};
-
 int log2(int v) {
   if (v > 0) {
     return 31 - __builtin_clz(v);
@@ -463,6 +459,23 @@ uint32_t hash32(uint32_t x) {
   return x;
 }
 
+int matchLength(uint8_t* src, uint8_t* match, uint8_t* end) {
+  // Do a fast match against the first 4 bytes.  Note that this
+  // excludes matches with length less than 4, but matches that
+  // small are not a good use of bits.
+  uint32_t* s32 = reinterpret_cast<uint32_t*>(src);
+  uint32_t* m32 = reinterpret_cast<uint32_t*>(match);
+  if (*s32 != *m32) {
+    return 0;
+  }
+
+  int len = 4;
+  while (src + len < end && src[len] == match[len]) {
+    ++len;
+  }
+  return len;
+}
+
 class MatchFinder {
 public:
   MatchFinder(int64_t window_size)
@@ -472,29 +485,15 @@ public:
     chain_.resize(window_size, -window_size);
   }
 
-  int matchLength(uint8_t* src, uint8_t* match, uint8_t* end) {
-    // Do a fast match against the first 4 bytes.  Note that this
-    // excludes matches with length less than 4, but matches that
-    // small are not a good use of bits.
-    uint32_t* s32 = reinterpret_cast<uint32_t*>(src);
-    uint32_t* m32 = reinterpret_cast<uint32_t*>(match);
-    if (*s32 != *m32) {
-      return 0;
-    }
-
-    int len = 4;
-    while (src + len < end && src[len] == match[len]) {
-      ++len;
-    }
-    return len;
-  }
-
+  // Insert `pos` into the hash chain without checking for matches.
   void insert(uint8_t* buf, int64_t pos) {
     int key = hash32(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16)) & window_mask_;
     chain_[pos & window_mask_] = ht_[key];
     ht_[key] = pos;
   }
 
+  // Insert `pos` into the hash chain, and check for best match.
+  // Returns length of best match found.  match_pos contains offset of best match.
   int findMatch(uint8_t* buf, uint8_t* buf_end, int64_t pos, int64_t& match_pos) {
     int best_match_len = 0;
 
@@ -506,10 +505,9 @@ public:
     // Limit the number of hash buckets we search, otherwise the search can blow up
     // for larger window sizes.
     const int kNumHits = 16;
-    const int kMinLength = 4;
     while (next > min_pos && ++hits < kNumHits) {
       int match_len = matchLength(&buf[pos], &buf[next], buf_end);
-      if (match_len > best_match_len && match_len > kMinLength) {
+      if (match_len > best_match_len) {
         best_match_len = match_len;
         match_pos = next;
       }
@@ -543,14 +541,6 @@ int literalLengthExtra(int literal_length) {
     return 0;
   }
   return literal_length - (1 << log2(literal_length));
-}
-
-uint8_t* writeVarint(uint8_t* buf, int v) {
-  while (v > 0x7f) {
-    *buf++ = 0x80 | (v & 0x7f);
-  }
-  *buf++ = v;
-  return buf;
 }
 
 template<int bytes>
@@ -593,7 +583,7 @@ public:
       // Output a match?  Or a literal?
       int64_t match_pos;
       int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
-      if (match_len != 0) {
+      if (match_len != 0 && i < p_end - 4) {
         match_offsets.push_back(i - match_pos);
         match_lengths.push_back(match_len);
         literal_lengths.push_back(num_literals);
