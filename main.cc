@@ -7,6 +7,9 @@
 #include <string>
 #include <vector>
 
+////////////
+// Utilities
+
 constexpr int kDebugLevel = 0;
 
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
@@ -17,6 +20,10 @@ struct Timer {
   double elapsed() const { return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now()-time_).count(); }
   std::chrono::high_resolution_clock::time_point time_;
 };
+
+////////////
+
+constexpr int64_t kMaxChunkSize = 1 << 18; // 256k
 
 std::string toBinary(int v, int size) {
   std::string result;
@@ -406,7 +413,7 @@ private:
 
 int64_t huffmanCompress(uint8_t* buf, int64_t len, uint8_t* out) {
   uint8_t* out_start = out;
-  int64_t chunk_size = 1 << 18; // 256k
+  int64_t chunk_size = kMaxChunkSize;
   for (int64_t start = 0; start < len; start += chunk_size) {
     int64_t remaining = std::min(chunk_size, len - start);
     uint8_t* marker = out;
@@ -433,7 +440,7 @@ int64_t huffmanCompress(uint8_t* buf, int64_t len, uint8_t* out) {
 
 void huffmanDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len) {
   int64_t read = 0;
-  int64_t chunk_size = 1 << 18; // 256k
+  int64_t chunk_size = kMaxChunkSize;
   uint8_t* buf_end = buf + len;
   while (buf < buf_end) {
     int compressed_size = buf[0] | (buf[1] << 8) | (buf[2] << 16);
@@ -522,6 +529,36 @@ public:
     return best_match_len;
   }
 
+  // Insert `pos` into the hash chain, and check for best match.
+  // Returns length of best match found.  match_pos contains offset of best match.
+  int findMatches(uint8_t* buf, uint8_t* buf_end, int64_t pos, int64_t* match_dist, int64_t* match_len) {
+    int key = hash32(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16)) & window_mask_;
+    int64_t next = ht_[key];
+    int64_t min_pos = pos - window_size_;
+
+    int matches = 0;
+    int hits = 0;
+    // Limit the number of hash buckets we search, otherwise the search can blow up
+    // for larger window sizes.
+    const int kNumHits = 16;
+    while (next > min_pos && ++hits < kNumHits) {
+      int len = matchLength(&buf[pos], &buf[next], buf_end);
+      if (len > 0) {
+        match_dist[matches] = pos - next;
+        match_len[matches] = len;
+        ++matches;
+      }
+
+      next = chain_[next & window_mask_];
+    }
+
+    // Insert new match
+    chain_[pos & window_mask_] = ht_[key];
+    ht_[key] = pos;
+
+    return matches;
+  }
+
 private:
   int64_t window_size_;
   int64_t window_mask_;
@@ -560,63 +597,57 @@ void writeInt(uint8_t* buf, int v) {
   }
 }
 
+int literal_price(int c) {
+  return 6;
+}
+
+int match_price(int len, int dist) {
+  int len_cost = 3;
+  len_cost += std::max(0, log2(len_cost) - 3);
+
+  int dist_cost = 3;
+  dist_cost += std::max(0, log2(dist_cost) - 3);
+
+  return len_cost + dist_cost;
+}
+
 class LzEncoder {
 public:
   // Initializes encoder with a backwards window of `window_size`.  Must be a power of 2!
-  LzEncoder(int64_t window_size)
-   : matcher_(window_size) {
+  LzEncoder(int64_t window_size, int level)
+   : matcher_(window_size),
+     level_(level) {
   }
 
   // Compresses `buffer` from `buffer+p` to `buffer+p_end`.
   // Writes compressed sequence to `out`.  `out` must contain at least `window_size` bytes!
   // Returns number of bytes written to `out`.
   int64_t encode(uint8_t* buffer, int64_t p, int64_t p_end, uint8_t* out) {
-    std::vector<int> match_offsets;
-    std::vector<int> match_lengths;
-    std::vector<int> literal_lengths;
-    std::vector<uint8_t> literals;
-
     uint8_t* out_start = out;
-    int num_literals = 0;
 
-    for (int64_t i = p; i < p_end; ++i) {
-      // Output a match?  Or a literal?
-      int64_t match_pos;
-      int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
-      if (match_len != 0 && i < p_end - 4) {
-        match_offsets.push_back(i - match_pos);
-        match_lengths.push_back(match_len);
-        literal_lengths.push_back(num_literals);
-        num_literals = 0;
+    num_seq_ = 0;
+    num_lit_ = 0;
 
-        // printf("Match cur:%lld, match:%lld len:%d\n", i, match_pos, match_len);
-        /*
-        printf("((");
-        for (int j = 0; j < match_len; ++j) {
-          printf("%c", buffer[i + j]);
-        }
-        printf("))");
-        */
-
-        while (--match_len > 0) {
-          matcher_.insert(buffer, ++i);
-        }
-      } else {
-        literals.push_back(buffer[i]);
-        ++num_literals;
-        // printf("%c", buffer[i]);
-      }
+    if (level_ == 0) {
+      fastParse(buffer, p, p_end);
+    } else if (level_ == 1) {
+      optimalParse(buffer, p, p_end);
     }
-    if (num_literals != 0) {
-      literal_lengths.push_back(num_literals);
-      match_offsets.push_back(0);
-      match_lengths.push_back(0);
+
+    /*
+    for (int i = 0; i < literal_lengths.size(); ++i) {
+      printf("lit:%d, %d, %d\n", literal_lengths[i], match_offsets[i], match_lengths[i]);
     }
+    for (int i = 0; i < literals.size(); ++i) {
+      printf("%c,", literals[i]);
+    }
+    printf("\n----\n");
+    */
 
     // Write literal section
     {
       // Uncompressed length
-      writeInt<3>(out, literals.size());
+      writeInt<3>(out, num_lit_);
       out += 3;
       // Compressed length
       uint8_t* marker = out;
@@ -624,21 +655,21 @@ public:
 
       // Huffman table for literals
       HuffmanEncoder encoder(out);
-      for (uint8_t literal : literals) {
-        encoder.scan(literal);
+      for (int i = 0; i < num_lit_; ++i) {
+        encoder.scan(literals_[i]);
       }
       encoder.buildTable();
-      for (uint8_t literal : literals) {
-        encoder.encode(literal);
+      for (int i = 0; i < num_lit_; ++i) {
+        encoder.encode(literals_[i]);
       }
       int64_t bytes_written = encoder.finish();
       out += bytes_written;
       writeInt<3>(marker, bytes_written);
-      LOGV(1, "literals: %lu -> %lld\n", literals.size(), bytes_written);
+      LOGV(1, "literals: %d -> %lld\n", num_lit_, bytes_written);
     }
 
     // Write sequences section
-    writeInt<3>(out, literal_lengths.size());
+    writeInt<3>(out, num_seq_);
     out += 3;
 
     /*
@@ -648,28 +679,122 @@ public:
     */
 
     // a. Literal lengths
-    int lit_len_out = writeValues(out, literal_lengths);
+    int lit_len_out = writeValues(out, literal_lengths_, num_seq_);
     out += lit_len_out;
     // b. Match offsets
-    int match_offsets_out = writeValues(out, match_offsets);
+    int match_offsets_out = writeValues(out, match_offsets_, num_seq_);
     out += match_offsets_out;
     // c. Match lengths
-    int match_lengths_out = writeValues(out, match_lengths);
+    int match_lengths_out = writeValues(out, match_lengths_, num_seq_);
     out += match_lengths_out;
 
-    LOGV(1, "Wrote block, %lu sequences lit_len:%d match_offsets:%d match_lengths:%d\n", literal_lengths.size(), lit_len_out, match_offsets_out, match_lengths_out);
+    LOGV(1, "Wrote block, %d sequences, %d literals, lit_len:%d match_offsets:%d match_lengths:%d\n",
+         num_seq_, num_lit_, lit_len_out, match_offsets_out, match_lengths_out);
 
     return out - out_start;
   }
 
 private:
-  int64_t writeValues(uint8_t* out, const std::vector<int>& values) {
+  void fastParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+    int num_literals = 0;
+
+    for (int64_t i = p; i < p_end; ++i) {
+      // Output a match?  Or a literal?
+      int64_t match_pos;
+      int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
+      if (match_len != 0 && i < p_end - 4) {
+        match_offsets_[num_seq_] = i - match_pos;
+        match_lengths_[num_seq_] = match_len;
+        literal_lengths_[num_seq_] = num_literals;
+        ++num_seq_;
+        num_literals = 0;
+
+        while (--match_len > 0) {
+          matcher_.insert(buffer, ++i);
+        }
+      } else {
+        literals_[num_lit_++] = buffer[i];
+        ++num_literals;
+      }
+    }
+    if (num_literals != 0) {
+      literal_lengths_[num_seq_] = num_literals;
+      match_offsets_[num_seq_] = 0;
+      match_lengths_[num_seq_] = 0;
+      ++num_seq_;
+    }
+  }
+
+  void optimalParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+    int64_t length = p_end - p;
+    std::vector<int> price(length + 1, 999999999);
+    std::vector<int> len(length + 1, 0);
+    std::vector<int> dist(length + 1, 0);
+
+    price[0] = 0;
+
+    for (int64_t i = 0; i < length; ++i) {
+      int lit_cost = price[i] + literal_price(buffer[i]);
+      if (lit_cost < price[i + 1]) {
+        price[i + 1] = lit_cost;
+        len[i + 1] = 1;
+        dist[i + 1] = 0;
+      }
+
+      // Don't try matches close to end of buffer.
+      if (i + 4 >= length) {
+        continue;
+      }
+
+      int64_t match_dist[16], match_len[16];
+      int matches = matcher_.findMatches(buffer, buffer + p_end, p + i, match_dist, match_len);
+      for (int j = 0; j < matches; ++j) {
+        int match_cost = price[i] + match_price(match_len[j], -match_dist[j]);
+        if (match_cost < price[i+ match_len[j]]) {
+          price[i + match_len[j]] = match_cost;
+          len[i + match_len[j]] = match_len[j];
+          dist[i + match_len[j]] = match_dist[j];
+        }
+      }
+
+      //printf("(%d, %d, %d)\n", price[i], len[i], dist[i]);
+    }
+    //printf("----\n");
+
+    if (len[length] <= 1) {
+      match_offsets_[num_seq_] = 0;
+      match_lengths_[num_seq_] = 0;
+      literal_lengths_[num_seq_] = 0;
+      ++num_seq_;
+    }
+    for (int64_t i = length; i > 0;) {
+      if (len[i] > 1) {
+        match_offsets_[num_seq_] = dist[i];
+        match_lengths_[num_seq_] = len[i];
+        literal_lengths_[num_seq_] = 0;
+        ++num_seq_;
+        i -= len[i];
+      } else {
+        literals_[num_lit_++] = buffer[p + i - 1];
+        ++literal_lengths_[num_seq_ - 1];
+        --i;
+      }
+    }
+
+    std::reverse(&literal_lengths_[0], &literal_lengths_[num_seq_]);
+    std::reverse(&match_offsets_[0], &match_offsets_[num_seq_]);
+    std::reverse(&match_lengths_[0], &match_lengths_[num_seq_]);
+    std::reverse(&literals_[0], &literals_[num_lit_]);
+  }
+
+  int64_t writeValues(uint8_t* out, const int* values, int num_seq) {
     HuffmanEncoder encoder(out, 32);
-    for (int v : values) {
-      encoder.scan(literalLengthCode(v));
+    for (int i = 0; i < num_seq; ++i) {
+      encoder.scan(literalLengthCode(values[i]));
     }
     encoder.buildTable();
-    for (int v : values) {
+    for (int i = 0; i < num_seq; ++i) {
+      int v = values[i];
       encoder.encode(literalLengthCode(v));
       LOGV(3, "Encoding %d -> %d (%d, %d)\n", v, literalLengthCode(v), log2(v), literalLengthExtra(v));
       if (v >= 16) {
@@ -681,15 +806,23 @@ private:
   }
 
   MatchFinder matcher_;
+  int level_;
+
+  int num_seq_;
+  int num_lit_;
+  uint8_t literals_[kMaxChunkSize];
+  int match_offsets_[kMaxChunkSize / 4];
+  int match_lengths_[kMaxChunkSize / 4];
+  int literal_lengths_[kMaxChunkSize / 4];
 };
 
 class LzDecoder {
 public:
   bool decode(uint8_t* buf, uint8_t* end, uint8_t* out, uint8_t* out_end) {
-    uint8_t literals[1 << 18];
-    int literal_lengths[1 << 16];
-    int match_offsets[1 << 16];
-    int match_lengths[1 << 16];
+    uint8_t literals[kMaxChunkSize];
+    int literal_lengths[kMaxChunkSize / 4];
+    int match_offsets[kMaxChunkSize / 4];
+    int match_lengths[kMaxChunkSize / 4];
 
     {
       int num_literals = readInt<3>(buf);
@@ -747,7 +880,7 @@ private:
 int64_t lzCompress(uint8_t* buf, int64_t len, uint8_t* out) {
   uint8_t* out_start = out;
   int64_t chunk_size = 1 << 18; // 256k
-  LzEncoder lz_encoder(chunk_size);
+  LzEncoder lz_encoder(chunk_size, 1);
 
   for (int64_t start = 0; start < len; start += chunk_size) {
     int64_t remaining = std::min(chunk_size, len - start);
@@ -902,6 +1035,7 @@ void testLz() {
   //std::string test = "ABCDEFGHIJKLMNOPQRS";
   //len = test.size();
   //uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
+
   uint8_t* buf = enwik8.get();
   Timer timer;
   int64_t encoded_size = lzCompress(buf, len, out.get());
