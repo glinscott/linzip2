@@ -610,12 +610,8 @@ int literal_price(int c) {
 }
 
 int match_price(int len, int dist) {
-  int len_cost = 3;
-  len_cost += std::max(0, log2(len_cost) - 3);
-
-  int dist_cost = 3;
-  dist_cost += std::max(0, log2(dist_cost) - 3);
-
+  int len_cost = 6 + log2(len);
+  int dist_cost = 6 + log2(dist);
   return len_cost + dist_cost;
 }
 
