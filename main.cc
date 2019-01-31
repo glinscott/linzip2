@@ -611,7 +611,7 @@ int literal_price(int c) {
 
 int match_price(int len, int dist) {
   int len_cost = 6 + log2(len);
-  int dist_cost = 6 + log2(dist);
+  int dist_cost = std::max(0, log2(dist) - 3);
   return len_cost + dist_cost;
 }
 
@@ -739,7 +739,7 @@ private:
       int64_t match_dist[16], match_len[16];
       int matches = matcher_.findMatches(buffer, buffer + p_end, p + i, match_dist, match_len);
       for (int j = 0; j < matches; ++j) {
-        int match_cost = price[i] + match_price(match_len[j], -match_dist[j]);
+        int match_cost = price[i] + match_price(match_len[j], match_dist[j]);
         if (match_cost < price[i+ match_len[j]]) {
           price[i + match_len[j]] = match_cost;
           len[i + match_len[j]] = match_len[j];
