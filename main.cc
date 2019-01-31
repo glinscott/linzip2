@@ -566,18 +566,26 @@ private:
   std::vector<int> chain_;
 };
 
-int literalLengthCode(int literal_length) {
-  if (literal_length <= 15) {
-    return literal_length;
+int lengthCode(int length) {
+  if (length <= 15) {
+    return length;
   }
-  return 12 + log2(literal_length);
+  return 12 + log2(length);
 }
 
-int literalLengthExtra(int literal_length) {
-  if (literal_length <= 15) {
-    return 0;
+int lengthExtra(int length) {
+  return length - (1 << log2(length));
+}
+
+int offsetCode(int offset) {
+  if (offset < 2) {
+    return offset;
   }
-  return literal_length - (1 << log2(literal_length));
+  return 1 + log2(offset);
+}
+
+int offsetExtra(int offset) {
+  return offset - (1 << log2(offset));
 }
 
 template<int bytes>
@@ -634,16 +642,6 @@ public:
       optimalParse(buffer, p, p_end);
     }
 
-    /*
-    for (int i = 0; i < literal_lengths.size(); ++i) {
-      printf("lit:%d, %d, %d\n", literal_lengths[i], match_offsets[i], match_lengths[i]);
-    }
-    for (int i = 0; i < literals.size(); ++i) {
-      printf("%c,", literals[i]);
-    }
-    printf("\n----\n");
-    */
-
     // Write literal section
     {
       // Uncompressed length
@@ -672,20 +670,14 @@ public:
     writeInt<3>(out, num_seq_);
     out += 3;
 
-    /*
-    for (int i = 0; i < literal_lengths.size(); ++i) {
-      LOGV(2, "Encoding (lit_len:%d, match_offset:%d, match_length:%d)\n", literal_lengths[i], match_offsets[i], match_lengths[i]);
-    }
-    */
-
     // a. Literal lengths
-    int lit_len_out = writeValues(out, literal_lengths_, num_seq_);
+    int lit_len_out = writeValues<false>(out, literal_lengths_);
     out += lit_len_out;
     // b. Match offsets
-    int match_offsets_out = writeValues(out, match_offsets_, num_seq_);
+    int match_offsets_out = writeValues<true>(out, match_offsets_);
     out += match_offsets_out;
     // c. Match lengths
-    int match_lengths_out = writeValues(out, match_lengths_, num_seq_);
+    int match_lengths_out = writeValues<false>(out, match_lengths_);
     out += match_lengths_out;
 
     LOGV(1, "Wrote block, %d sequences, %d literals, lit_len:%d match_offsets:%d match_lengths:%d\n",
@@ -696,13 +688,14 @@ public:
 
 private:
   void fastParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+    const int kMinMatchLen = 5;
     int num_literals = 0;
 
     for (int64_t i = p; i < p_end; ++i) {
       // Output a match?  Or a literal?
       int64_t match_pos;
       int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
-      if (match_len != 0 && i < p_end - 4) {
+      if (match_len >= kMinMatchLen && i < p_end - 4) {
         match_offsets_[num_seq_] = i - match_pos;
         match_lengths_[num_seq_] = match_len;
         literal_lengths_[num_seq_] = num_literals;
@@ -733,6 +726,7 @@ private:
 
     price[0] = 0;
 
+    // Forward pass, calculate best price for literal or match at each position.
     for (int64_t i = 0; i < length; ++i) {
       int lit_cost = price[i] + literal_price(buffer[i]);
       if (lit_cost < price[i + 1]) {
@@ -756,11 +750,9 @@ private:
           dist[i + match_len[j]] = match_dist[j];
         }
       }
-
-      //printf("(%d, %d, %d)\n", price[i], len[i], dist[i]);
     }
-    //printf("----\n");
 
+    // Backward pass, pick best option at each step.
     if (len[length] <= 1) {
       match_offsets_[num_seq_] = 0;
       match_lengths_[num_seq_] = 0;
@@ -781,24 +773,28 @@ private:
       }
     }
 
+    // We wrote the arrays in reverse, flip them for uniformity.
     std::reverse(&literal_lengths_[0], &literal_lengths_[num_seq_]);
     std::reverse(&match_offsets_[0], &match_offsets_[num_seq_]);
     std::reverse(&match_lengths_[0], &match_lengths_[num_seq_]);
     std::reverse(&literals_[0], &literals_[num_lit_]);
   }
 
-  int64_t writeValues(uint8_t* out, const int* values, int num_seq) {
+  template<bool is_offset>
+  int64_t writeValues(uint8_t* out, const int* values) {
     HuffmanEncoder encoder(out, 32);
-    for (int i = 0; i < num_seq; ++i) {
-      encoder.scan(literalLengthCode(values[i]));
+    for (int i = 0; i < num_seq_; ++i) {
+      encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
     }
     encoder.buildTable();
-    for (int i = 0; i < num_seq; ++i) {
+    for (int i = 0; i < num_seq_; ++i) {
       int v = values[i];
-      encoder.encode(literalLengthCode(v));
-      LOGV(3, "Encoding %d -> %d (%d, %d)\n", v, literalLengthCode(v), log2(v), literalLengthExtra(v));
-      if (v >= 16) {
-        int extra = literalLengthExtra(v);
+      encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
+      LOGV(3, "Encoding %d -> %d (%d, %d)\n",
+           v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
+           is_offset ? offsetExtra(v) : lengthExtra(v));
+      if (v >= (is_offset ? 2 : 16)) {
+        int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
         encoder.writer().writeBits(extra, log2(v));
       }
     }
@@ -840,13 +836,16 @@ public:
     buf += 3;
     LOGV(1, "Read %d sequences\n", num_seq);
 
-    buf += decodeValues(buf, end, num_seq, literal_lengths);
-    buf += decodeValues(buf, end, num_seq, match_offsets);
-    buf += decodeValues(buf, end, num_seq, match_lengths);
+    buf += decodeValues<false>(buf, end, num_seq, literal_lengths);
+    buf += decodeValues<true>(buf, end, num_seq, match_offsets);
+    buf += decodeValues<false>(buf, end, num_seq, match_lengths);
+
+    uint8_t* out_dbg = out;
 
     uint8_t* l_head = literals;
     for (int i = 0; i < num_seq; ++i) {
-      LOGV(2, "Sequence (lit_len:%d, match_offset:%d, match_length:%d)\n", literal_lengths[i], match_offsets[i], match_lengths[i]);
+      LOGV(3, "Sequence (lit_len:%d, match_offset:%d, match_length:%d)\n",
+           literal_lengths[i], match_offsets[i], match_lengths[i]);
       for (int j = 0; j < literal_lengths[i]; ++j) {
         *out++ = *l_head++;
       }
@@ -859,15 +858,17 @@ public:
   }
 
 private:
+  template<bool is_offset>
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
     const int kSymBits = 5;
     HuffmanDecoder decoder(buf, end, kSymBits);
     decoder.readTable();
     for (int i = 0; i < num_seq; ++i) {
       int v = decoder.decodeOne();
-      if (v >= 16) {
-        int extra_bits = v - 12;
+      if (v >= (is_offset ? 2 : 16)) {
+        int extra_bits = v - (is_offset ? 1 : 12);
         v = 1 << extra_bits;
+        decoder.br().refill();
         v |= decoder.br().readBits(extra_bits);
       }
       values[i] = v;
@@ -973,9 +974,6 @@ bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
     encoder.encode(buf[i]);
   }
   int64_t encoded_size = encoder.finish();
-  // printf("Encoded %lld into %lld bytes\n", len, encoded_size);
-  // double elapsed = timer.elapsed() / 1000;
-  // printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
 
   std::unique_ptr<uint8_t> decoded;
   decoded.reset(new uint8_t[len]);
@@ -1023,8 +1021,11 @@ void huffmanSpeed() {
 }
 
 void testLz() {
+  uint8_t* buf;
   int64_t len;
+
   std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
+  buf = enwik8.get();
   len = 10000000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
@@ -1034,9 +1035,8 @@ void testLz() {
   //test = test + test + test + test + test;
   //std::string test = "ABCDEFGHIJKLMNOPQRS";
   //len = test.size();
-  //uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
+  //buf = reinterpret_cast<uint8_t*>(&test[0]);
 
-  uint8_t* buf = enwik8.get();
   Timer timer;
   int64_t encoded_size = lzCompress(buf, len, out.get());
   printf("Encoded %lld into %lld bytes\n", len, encoded_size);
