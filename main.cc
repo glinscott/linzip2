@@ -21,6 +21,9 @@ struct Timer {
   std::chrono::high_resolution_clock::time_point time_;
 };
 
+bool FLAG_test = false;
+int FLAG_level = 1;
+
 ////////////
 
 constexpr int64_t kMaxChunkSize = 1 << 18; // 256k
@@ -236,7 +239,7 @@ public:
 private:
   void writeTable(int num_symbols) {
     const int kSymBits = log2(max_symbols_);
-    writer_.writeBits(num_symbols, kSymBits);
+    writer_.writeBits(num_symbols - 1, kSymBits);
 
     for (int i = 0; i < num_symbols; ++i) {
       writer_.writeBits(nodes_[i].symbol, kSymBits);
@@ -250,6 +253,7 @@ private:
   void buildCodes(int num_symbols) {
     int code = 0;
     int last_level = -1;
+    LOGV(2, "Write num_symbols %d\n", num_symbols);
     for (int i = 0; i < num_symbols; ++i) {
       // Build the binary representation.
       int level = nodes_[i].freq;
@@ -326,7 +330,7 @@ public:
 
   void readTable() {
     br_.refill();
-    num_symbols_ = br_.readBits(sym_bits_);
+    num_symbols_ = br_.readBits(sym_bits_) + 1;
 
     CHECK(num_symbols_ <= kMaxSymbols);
 
@@ -1022,7 +1026,7 @@ void testLz() {
 
   std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
   buf = enwik8.get();
-  len = 10000000;
+  // len = 10000000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -1059,8 +1063,7 @@ void testShort() {
   printf("Encoded into %lld\n", encoded_size);
 }
 
-int main() {
-  /*
+void tests() {
   int64_t len;
   std::unique_ptr<uint8_t> buf = readEnwik8(len);
   printf("Read %lld bytes\n", len);
@@ -1071,7 +1074,13 @@ int main() {
   for (int i = 1; i < 1000; i += 50) {
     CHECK(testHuffman(buf.get(), out.get(), i));
   }
-  */
+}
+
+int main(int argc, char** argv) {
+  if (FLAG_test) {
+    tests();
+    return 0;
+  }
 
   //huffmanSpeed();
   // testShort();
