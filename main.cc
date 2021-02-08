@@ -10,7 +10,7 @@
 ////////////
 // Utilities
 
-constexpr int kDebugLevel = 0;
+constexpr int kDebugLevel = 2;
 
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
 #define LOGV(level, s, ...) do{if(level<=kDebugLevel) fprintf(stderr, s, ##__VA_ARGS__);}while(0);
@@ -22,7 +22,9 @@ struct Timer {
 };
 
 bool FLAG_test = false;
-int FLAG_level = 1;
+int FLAG_level = 0;
+int FLAG_window_size = 18;
+int FLAG_max_matches = 8;
 
 ////////////
 
@@ -39,9 +41,8 @@ std::string toBinary(int v, int size) {
 int log2(int v) {
   if (v > 0) {
     return 31 - __builtin_clz(v);
-  } else {
-    return 0;
   }
+  return 0;
 }
 
 class BitReader {
@@ -49,6 +50,16 @@ public:
   BitReader(uint8_t* buffer, uint8_t* end)
     : current_(buffer),
       end_(end) {
+    refill();
+  }
+
+  // offset adjusts the stream position before reading any bits.  This allows
+  // the BitReader to resume a "backward" stream, which doesn't have to end on
+  // a byte boundary.
+  BitReader(uint8_t* buffer, uint8_t* end, int offset)
+    : current_(buffer),
+      end_(end) {
+    position_ += offset;
     refill();
   }
 
@@ -81,13 +92,10 @@ public:
     }
   }
 
-  uint8_t* end() const {
-    return end_;
-  }
-
-  uint32_t bits() const {
-    return bits_;
-  }
+  uint8_t* current() const { return current_; }
+  uint8_t* end() const { return end_; }
+  uint32_t bits() const { return bits_; }
+  int position() const { return position_; }
 
   // Actual location we have read up to in the byte stream.
   uint8_t* cursor() const {
@@ -143,6 +151,51 @@ private:
       *current_ = (bits_ >> position_) & 0xFF;
       ++current_;
     }
+  }
+
+private:
+  uint8_t* start_;
+  uint8_t* current_;
+  uint32_t bits_ = 0;
+  int position_ = 0;
+};
+
+class ReverseBitWriter {
+public:
+  // ReverseBitWriter starts writing from buffer (end-exclusive) going downwards
+  // in memory, instead of going forward.  Eg. written data is from:
+  // [buffer - finish(), buffer)
+  ReverseBitWriter(uint8_t* buffer)
+    : start_(buffer),
+      current_(buffer) {
+  }
+
+  int position() const { return position_; }
+
+  void writeBits(uint32_t v, int n) {
+    bits_ = (bits_ >> n) | (v << (32 - n));
+    position_ += n;
+    if (position_ >= 8) {
+      flush();
+    }
+  }
+
+  int64_t finish() {
+    CHECK(position_ >= 0 && position_ < 8);
+    if (position_ > 0) {
+      // Final byte is a bit tricky.  Handle it specially.
+      --current_;
+      *current_ = bits_ >> (32 - position_);
+      bits_ = 0;
+    }
+    return start_ - current_;
+  }
+
+private:
+  void flush() {
+    *reinterpret_cast<uint32_t*>(current_ - 4) = __builtin_bswap32(bits_ >> (32 - position_));
+    current_ -= position_ >> 3;
+    position_ &= 7;
   }
 
 private:
@@ -460,6 +513,257 @@ void huffmanDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len)
   }
 }
 
+void sortSymbols(int state_len, int num_symbols, int* freq, int* sorted_symbols) {
+  // http://fastcompression.blogspot.com/2014/02/fse-distributing-symbol-values.html
+  // http://cbloomrants.blogspot.com/2014/02/02-06-14-understanding-ans-8.html
+  std::pair<float, int> sorted[state_len];
+  int at = 0;
+  for (int symbol = 0; symbol < num_symbols; ++symbol) {
+    int count = freq[symbol];
+    if (count == 0)
+      continue;
+    float invp = 1.0f / count;
+    for (int j = 0; j < count; ++j) {
+      sorted[at].second = symbol;
+      sorted[at].first = invp + j * invp;
+      ++at;
+    }
+  }
+  CHECK(at == state_len);
+  std::stable_sort(&sorted[0], &sorted[state_len]);
+  for (int i = 0; i < state_len; ++i)
+    sorted_symbols[i] = sorted[i].second;
+}
+
+class FSEEncoder {
+public:
+  FSEEncoder(uint8_t* buffer, int max_symbols = 256, int state_bits = 12)
+    : writer_(buffer),
+      max_symbols_(max_symbols),
+      state_bits_(state_bits),
+      state_len_(1 << state_bits_) {
+    CHECK(state_bits <= 12); // Otherwise need larger table length
+    memset(freq_, 0, sizeof(freq_));
+    state_ = state_len_;
+  }
+
+  void scan(int symbol) {
+    ++freq_[symbol];
+  }
+
+  void buildTable() {
+    normalize();
+    sortSymbols(state_len_, max_symbols_, freq_, sorted_symbols_);
+
+    // http://cbloomrants.blogspot.com/2014/02/02-18-14-understanding-ans-12.html
+    int next_state[256];
+    int cum_prob[256];
+    for (int i = 0; i < max_symbols_; ++i)
+      next_state[i] = freq_[i];
+    cum_prob[0] = 0;
+    for (int i = 1; i < max_symbols_; ++i)
+      cum_prob[i] = cum_prob[i - 1] + freq_[i - 1];
+    for (int i = 0; i < state_len_; ++i) {
+      int symbol = sorted_symbols_[i];
+      int from_state = next_state[symbol];
+      ++next_state[symbol];
+      int to_state = state_len_ + i;
+      packed_table_[cum_prob[symbol] + from_state - freq_[symbol]] = to_state;
+    }
+
+    // Now, build the final encoding table.
+    int total = 0;
+    for (int symbol = 0; symbol < max_symbols_; ++symbol) {
+      if (freq_[symbol] == 0)
+        continue;
+      uint32_t max_bits_out = state_bits_ - log2(freq_[symbol] - 1);
+      uint32_t min_state_plus = freq_[symbol] << max_bits_out;
+      encoded_[symbol].delta_bits = (max_bits_out << 16) - min_state_plus;
+      encoded_[symbol].delta_state = total - freq_[symbol];
+      total += freq_[symbol];
+    }
+  }
+
+  int64_t writeTable(uint8_t* buffer) {
+    BitWriter writer(buffer);
+    writer.writeBits(state_bits_, 4);
+
+    int remaining = state_len_;
+    for (int i = 0; i < max_symbols_ && remaining != 0; ++i) {
+      writer.writeBits(freq_[i], log2(remaining) + 1);
+      remaining -= freq_[i];
+    }
+
+    CHECK(writer_.position() >= 0 && writer_.position() < 8);
+    writer.writeBits(writer_.position(), 3);
+
+    // Byte align after the table
+    return writer.finish();
+  }
+
+  void encode(int symbol) {
+    // http://fastcompression.blogspot.com/2014/02/fse-tricks-memory-efficient-subrange.html
+    int num_bits = (state_ + encoded_[symbol].delta_bits) >> 16;
+    writer_.writeBits(state_, num_bits);
+
+    int subrange_id = state_ >> num_bits;
+    state_ = packed_table_[subrange_id + encoded_[symbol].delta_state];
+  }
+
+  int64_t finish() {
+    writer_.writeBits(state_ & ((1 << state_bits_) - 1), state_bits_);
+    return writer_.finish();
+  }
+
+private:
+  void normalize() {
+    // http://cbloomrants.blogspot.com/2014/02/02-11-14-understanding-ans-10.html
+    int total = 0;
+    for (int i = 0; i < max_symbols_; ++i)
+      total += freq_[i];
+
+    // normalization
+    int new_total = 0;
+    int max_freq = 0;
+    int max_freq_i = 0;
+    for (int symbol = 0; symbol < max_symbols_; ++symbol) {
+      uint64_t c = freq_[symbol];
+      if (c == 0)
+        continue;
+      if (c > max_freq) {
+        max_freq = c;
+        max_freq_i = symbol;
+      }
+      freq_[symbol] = std::max(1, int(((c << state_bits_) + (total / 2)) / total));
+      LOGV(2, "scaled_freq[%d] = %d\n", symbol, freq_[symbol]);
+      new_total += freq_[symbol];
+    }
+
+    // Distribute any remaining error to the largest symbol (not optimal - but it works).
+    int err = new_total - state_len_;
+    LOGV(2, "normalization error: %d\n", err);
+    CHECK(err < freq_[max_freq_i]);
+    freq_[max_freq_i] -= err;
+  }
+
+  ReverseBitWriter writer_;
+
+  const int max_symbols_;
+  int freq_[256];
+
+  struct EncodedSymbol {
+    int delta_bits;
+    int delta_state;
+  };
+  EncodedSymbol encoded_[256];
+
+  // state_bits_ up to 13 is low enough to fit decode_table in L1
+  const int state_bits_;
+  const int state_len_;
+  int state_; // (2^state_bits, 2^(state_bits+1)]
+  int sorted_symbols_[4096];
+  int packed_table_[4096];
+};
+
+class FSEDecoder {
+public:
+  FSEDecoder(uint8_t* buffer, uint8_t* end)
+    : br_(buffer, end) {
+  }
+
+  BitReader& br() { return br_; }
+
+  void readTable() {
+    br_.refill();
+    state_bits_ = br_.readBits(4);
+    state_len_ = 1 << state_bits_;
+
+    int freq[256];
+    int remaining = state_len_;
+    for (num_symbols_ = 0; remaining > 0; ++num_symbols_) {
+      CHECK(num_symbols_ < 256);
+      br_.refill();
+      freq[num_symbols_] = br_.readBits(log2(remaining) + 1);
+      remaining -= freq[num_symbols_];
+      if (freq[num_symbols_] > 0) {
+        LOGV(2, "sym:%d len:%d remaining:%d\n", num_symbols_, freq[num_symbols_], remaining);
+      }
+    }
+    CHECK(remaining == 0);
+
+    int sorted_symbols[4096];
+    sortSymbols(state_len_, num_symbols_, freq, sorted_symbols);
+
+    int next_state[256];
+    for (int i = 0; i < num_symbols_; ++i)
+      next_state[i] = freq[i];
+    for (int i = 0; i < state_len_; ++i) {
+      int symbol = sorted_symbols[i];
+      decode_[i].symbol = symbol;
+      int from_state = next_state[symbol];
+      ++next_state[symbol];
+      decode_[i].num_bits = state_bits_ - log2(from_state);
+      decode_[i].state = (from_state << decode_[i].num_bits) - state_len_;
+    }
+
+    int position = br_.readBits(3);
+
+    // Ensure we catch up to be byte aligned.
+    br_.byteAlign();
+
+    // Start reading reversed bitstream.
+    br_ = BitReader(br_.cursor(), br_.end(), 8-position);
+    state_ = br_.readBits(state_bits_);
+  }
+
+  void decode(uint8_t* output, uint8_t* output_end) {
+    uint8_t* src = br_.current();
+    uint8_t* src_end = br_.end();
+    int position = br_.position();
+    uint32_t bits = br_.bits();
+
+    for (;;) {
+      *output++ = decode_[state_].symbol;
+      if (output >= output_end) {
+        break;
+      }
+      int len = decode_[state_].num_bits;
+      while (position >= 0) {
+        bits |= (src < src_end ? *src : 0) << position;
+        position -= 8;
+        ++src;
+      }
+      int n = bits >> (32 - len);
+      state_ = decode_[state_].state + n;
+      bits <<= len;
+      position += len;
+    }
+  }
+
+  uint8_t decodeOne() {
+    int symbol = decode_[state_].symbol;
+    int len = decode_[state_].num_bits;
+    br_.refill();
+    int n = br_.readBits(len);
+    state_ = decode_[state_].state + n;
+    return symbol;
+  }
+
+private:
+  struct DecodeEntry {
+    int state;
+    int num_bits;
+    int symbol;
+  };
+
+  BitReader br_;
+  int state_;
+  int state_bits_;
+  int state_len_;
+  int num_symbols_;
+  DecodeEntry decode_[4096];
+};
+
 // From https://github.com/skeeto/hash-prospector
 uint32_t hash32(uint32_t x) {
   x ^= x >> 18;
@@ -515,8 +819,7 @@ public:
     int hits = 0;
     // Limit the number of hash buckets we search, otherwise the search can blow up
     // for larger window sizes.
-    const int kNumHits = 16;
-    while (next > min_pos && ++hits < kNumHits) {
+    while (next > min_pos && ++hits < FLAG_max_matches) {
       int match_len = matchLength(&buf[pos], &buf[next], buf_end);
       if (match_len > best_match_len) {
         best_match_len = match_len;
@@ -544,8 +847,7 @@ public:
     int hits = 0;
     // Limit the number of hash buckets we search, otherwise the search can blow up
     // for larger window sizes.
-    const int kNumHits = 16;
-    while (next > min_pos && ++hits < kNumHits) {
+    while (next > min_pos && ++hits < FLAG_max_matches) {
       int len = matchLength(&buf[pos], &buf[next], buf_end);
       if (len > 0) {
         match_dist[matches] = pos - next;
@@ -881,7 +1183,7 @@ private:
 int64_t lzCompress(uint8_t* buf, int64_t len, uint8_t* out) {
   uint8_t* out_start = out;
   int64_t chunk_size = 1 << 18; // 256k
-  LzEncoder lz_encoder(chunk_size, 1);
+  LzEncoder lz_encoder(1 << FLAG_window_size, FLAG_level);
 
   for (int64_t start = 0; start < len; start += chunk_size) {
     int64_t remaining = std::min(chunk_size, len - start);
@@ -915,6 +1217,7 @@ void lzDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len) {
 
 std::unique_ptr<uint8_t> readEnwik8(int64_t& len) {
   FILE* f = fopen("enwik8", "r");
+  // FILE* f = fopen("data/silesia.tar", "r");
   fseek(f, 0, SEEK_END);
   len = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -1020,6 +1323,32 @@ void huffmanSpeed() {
   }
 }
 
+void tuneSettings() {
+  uint8_t* buf;
+  int64_t len;
+
+  std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
+  buf = enwik8.get();
+  printf("Read %lld bytes\n", len);
+  std::unique_ptr<uint8_t> out;
+  out.reset(new uint8_t[len]);
+
+  for (int level = 0; level <= 1; ++level) {
+    for (int window_size = /*14*/26; window_size <= 26; window_size += 4) {
+      for (int matches = /*2*/16; matches <= 16; matches += 2) {
+        FLAG_level = level;
+        FLAG_window_size = window_size;
+        FLAG_max_matches = matches;
+
+        Timer timer;
+        int64_t encoded_size = lzCompress(buf, len, out.get());
+        double elapsed = timer.elapsed() / 1000;
+        printf("level:%d, window:%d, matches:%d, %lld bytes, %.2lf seconds, %.2lf MB/s\n", level, window_size, matches, encoded_size, elapsed, (len / (1024. * 1024.)) / elapsed);
+      }
+    }
+  }
+}
+
 void testLz() {
   uint8_t* buf;
   int64_t len;
@@ -1031,11 +1360,6 @@ void testLz() {
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
 
-  //std::string test = "ABABABABCAAAABBBBABC";
-  //test = test + test + test + test + test;
-  //std::string test = "ABCDEFGHIJKLMNOPQRS";
-  //len = test.size();
-  //buf = reinterpret_cast<uint8_t*>(&test[0]);
 
   Timer timer;
   int64_t encoded_size = lzCompress(buf, len, out.get());
@@ -1054,13 +1378,69 @@ void testLz() {
 }
 
 void testShort() {
-  std::string test = "AAAAAAAABBBBBBBCCCCD";
-  int64_t len = test.size();
-  uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
-  std::unique_ptr<uint8_t> out;
-  out.reset(new uint8_t[100+len]);
-  int64_t encoded_size = huffmanCompress(buf, len, out.get());
-  printf("Encoded into %lld\n", encoded_size);
+  std::vector<std::string> tests{
+    "ABABABABCAAAABBBBABC",
+    "ABCDEFGHIJKLMNOPQRS",
+    "AAAAAAAABBBBBBBCCCCD",
+  };
+  tests.push_back(tests[0] + tests[0] + tests[0] + tests[0] + tests[0]);
+  for (auto& test : tests) {
+    int64_t len = test.size();
+    uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
+    std::unique_ptr<uint8_t> out;
+    out.reset(new uint8_t[100+len]);
+    int64_t encoded_size = huffmanCompress(buf, len, out.get());
+    std::unique_ptr<uint8_t> decoded;
+    decoded.reset(new uint8_t[len]);
+    huffmanDecompress(out.get(), encoded_size, decoded.get(), len);
+    checkBytes(decoded.get(), buf, len);
+  }
+}
+
+void testFSEEncoder() {
+  std::vector<std::string> tests{
+    "ABABABABCAAAABBBBABC",
+    "ABCDEFGHIJKLMNOPQRS",
+    "AAAAAAAABBBBBBBCCCCD",
+  };
+  tests.push_back(tests[0] + tests[0] + tests[0] + tests[0] + tests[0]);
+  for (auto& test : tests) {
+    int64_t len = test.size();
+    uint8_t* buf = reinterpret_cast<uint8_t*>(&test[0]);
+    std::unique_ptr<uint8_t> out;
+    int out_size = 512 + len;
+    out.reset(new uint8_t[out_size]);
+    FSEEncoder encoder(out.get() + out_size);
+    for (int64_t i = 0; i < len; ++i) {
+      encoder.scan(buf[i]);
+    }
+    encoder.buildTable();
+    for (int64_t i = len - 1; i >= 0; --i) {
+      encoder.encode(buf[i]);
+    }
+    int64_t encoded_size = encoder.finish();
+    int64_t table_size = encoder.writeTable(out.get());
+    uint8_t* out_start = out.get() + out_size - encoded_size;
+    memmove(out_start - table_size, out.get(), table_size);
+    printf("Original: %lld Encoded size: %lld\n", len, encoded_size);
+
+    std::unique_ptr<uint8_t> decoded;
+    decoded.reset(new uint8_t[len]);
+    {
+      FSEDecoder decoder(out_start - table_size, out_start + encoded_size);
+      decoder.readTable();
+      decoder.decode(decoded.get(), decoded.get() + len);
+      CHECK(checkBytes(decoded.get(), buf, len) == 0);
+    }
+    {
+      FSEDecoder decoder(out_start - table_size, out_start + encoded_size);
+      decoder.readTable();
+      for (int64_t i = 0; i < len; ++i) {
+        decoded.get()[i] = decoder.decodeOne();
+      }
+      CHECK(checkBytes(decoded.get(), buf, len) == 0);
+    }
+  }
 }
 
 void tests() {
@@ -1076,16 +1456,18 @@ void tests() {
   }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char const* argv[]) {
   if (FLAG_test) {
     tests();
     return 0;
   }
 
   //huffmanSpeed();
-  // testShort();
+  //testShort();
+  testFSEEncoder();
 
-  testLz();
+  //testLz();
+  //tuneSettings();
 
   return 0;
 }
