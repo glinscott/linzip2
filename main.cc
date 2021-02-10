@@ -10,7 +10,7 @@
 ////////////
 // Utilities
 
-constexpr int kDebugLevel = 2;
+constexpr int kDebugLevel = 0;
 
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
 #define LOGV(level, s, ...) do{if(level<=kDebugLevel) fprintf(stderr, s, ##__VA_ARGS__);}while(0);
@@ -25,6 +25,8 @@ bool FLAG_test = false;
 int FLAG_level = 0;
 int FLAG_window_size = 18;
 int FLAG_max_matches = 8;
+
+constexpr bool kUseFSE = true;
 
 ////////////
 
@@ -71,7 +73,7 @@ public:
   }
 
   int readBits(int n) {
-    int r = bits_ >> (32 - n);
+    int r = (bits_ >> 1) >> (31 - n);
     bits_ <<= n;
     position_ += n;
     return r;
@@ -547,6 +549,8 @@ public:
     state_ = state_len_;
   }
 
+  ReverseBitWriter& writer() { return writer_; }
+
   void scan(int symbol) {
     ++freq_[symbol];
   }
@@ -677,6 +681,7 @@ public:
     br_.refill();
     state_bits_ = br_.readBits(4);
     state_len_ = 1 << state_bits_;
+    LOGV(2, "state_bits:%d\n", state_bits_);
 
     int freq[256];
     int remaining = state_len_;
@@ -712,7 +717,7 @@ public:
     br_.byteAlign();
 
     // Start reading reversed bitstream.
-    br_ = BitReader(br_.cursor(), br_.end(), 8-position);
+    br_ = BitReader(br_.cursor(), br_.end(), position == 0 ? 0 : 8 - position);
     state_ = br_.readBits(state_bits_);
   }
 
@@ -944,6 +949,13 @@ public:
       optimalParse(buffer, p, p_end);
     }
 
+    if (kDebugLevel >= 3) {
+      for (int i = 0; i < num_seq_; ++i) {
+        LOGV(3, "Encoded (lit_len:%d, match_offset:%d, match_length:%d)\n",
+             literal_lengths_[i], match_offsets_[i], match_lengths_[i]);
+      }
+    }
+
     // Write literal section
     {
       // Uncompressed length
@@ -996,8 +1008,8 @@ private:
     for (int64_t i = p; i < p_end; ++i) {
       // Output a match?  Or a literal?
       int64_t match_pos;
-      int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
-      if (match_len >= kMinMatchLen && i < p_end - 4) {
+      int match_len;
+      if (i < p_end - 4 && (match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos)) >= kMinMatchLen) {
         match_offsets_[num_seq_] = i - match_pos;
         match_lengths_[num_seq_] = match_len;
         literal_lengths_[num_seq_] = num_literals;
@@ -1084,23 +1096,47 @@ private:
 
   template<bool is_offset>
   int64_t writeValues(uint8_t* out, const int* values) {
-    HuffmanEncoder encoder(out, 32);
-    for (int i = 0; i < num_seq_; ++i) {
-      encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
-    }
-    encoder.buildTable();
-    for (int i = 0; i < num_seq_; ++i) {
-      int v = values[i];
-      encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
-      LOGV(3, "Encoding %d -> %d (%d, %d)\n",
-           v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
-           is_offset ? offsetExtra(v) : lengthExtra(v));
-      if (v >= (is_offset ? 2 : 16)) {
-        int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
-        encoder.writer().writeBits(extra, log2(v));
+    if (kUseFSE) {
+      uint8_t* end = scratch + kMaxChunkSize;
+      FSEEncoder encoder(end, 32, 9);
+      for (int i = 0; i < num_seq_; ++i) {
+        encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
       }
+      encoder.buildTable();
+      for (int64_t i = num_seq_ - 1; i >= 0; --i) {
+        int v = values[i];
+        if (v >= (is_offset ? 2 : 16)) {
+          int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
+          encoder.writer().writeBits(extra, log2(v));
+        }
+        encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
+        LOGV(3, "Encoding %d -> %d (%d, %d)\n",
+             v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
+             is_offset ? offsetExtra(v) : lengthExtra(v));
+      }
+      int64_t encoded_size = encoder.finish();
+      int64_t table_size = encoder.writeTable(out);
+      memmove(out + table_size, end - encoded_size, encoded_size);
+      return table_size + encoded_size;
+    } else {
+      HuffmanEncoder encoder(out, 32);
+      for (int i = 0; i < num_seq_; ++i) {
+        encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
+      }
+      encoder.buildTable();
+      for (int i = 0; i < num_seq_; ++i) {
+        int v = values[i];
+        encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
+        LOGV(3, "Encoding %d -> %d (%d, %d)\n",
+             v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
+             is_offset ? offsetExtra(v) : lengthExtra(v));
+        if (v >= (is_offset ? 2 : 16)) {
+          int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
+          encoder.writer().writeBits(extra, log2(v));
+        }
+      }
+      return encoder.finish();
     }
-    return encoder.finish();
   }
 
   MatchFinder matcher_;
@@ -1112,6 +1148,7 @@ private:
   int match_offsets_[kMaxChunkSize / 4];
   int match_lengths_[kMaxChunkSize / 4];
   int literal_lengths_[kMaxChunkSize / 4];
+  uint8_t scratch[kMaxChunkSize];
 };
 
 class LzDecoder {
@@ -1142,8 +1179,6 @@ public:
     buf += decodeValues<true>(buf, end, num_seq, match_offsets);
     buf += decodeValues<false>(buf, end, num_seq, match_lengths);
 
-    uint8_t* out_dbg = out;
-
     uint8_t* l_head = literals;
     for (int i = 0; i < num_seq; ++i) {
       LOGV(3, "Sequence (lit_len:%d, match_offset:%d, match_length:%d)\n",
@@ -1162,21 +1197,38 @@ public:
 private:
   template<bool is_offset>
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
-    const int kSymBits = 5;
-    HuffmanDecoder decoder(buf, end, kSymBits);
-    decoder.readTable();
-    for (int i = 0; i < num_seq; ++i) {
-      int v = decoder.decodeOne();
-      if (v >= (is_offset ? 2 : 16)) {
-        int extra_bits = v - (is_offset ? 1 : 12);
-        v = 1 << extra_bits;
-        decoder.br().refill();
-        v |= decoder.br().readBits(extra_bits);
+    if (kUseFSE) {
+      FSEDecoder decoder(buf, end);
+      decoder.readTable();
+      for (int i = 0; i < num_seq; ++i) {
+        int v = decoder.decodeOne();
+        if (v >= (is_offset ? 2 : 16)) {
+          int extra_bits = v - (is_offset ? 1 : 12);
+          v = 1 << extra_bits;
+          decoder.br().refill();
+          v |= decoder.br().readBits(extra_bits);
+        }
+        values[i] = v;
       }
-      values[i] = v;
+      decoder.br().byteAlign();
+      return decoder.br().cursor() - buf;
+    } else {
+      const int kSymBits = 5;
+      HuffmanDecoder decoder(buf, end, kSymBits);
+      decoder.readTable();
+      for (int i = 0; i < num_seq; ++i) {
+        int v = decoder.decodeOne();
+        if (v >= (is_offset ? 2 : 16)) {
+          int extra_bits = v - (is_offset ? 1 : 12);
+          v = 1 << extra_bits;
+          decoder.br().refill();
+          v |= decoder.br().readBits(extra_bits);
+        }
+        values[i] = v;
+      }
+      decoder.br().byteAlign();
+      return decoder.br().cursor() - buf;
     }
-    decoder.br().byteAlign();
-    return decoder.br().cursor() - buf;
   }
 };
 
@@ -1355,11 +1407,9 @@ void testLz() {
 
   std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
   buf = enwik8.get();
-  // len = 10000000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
-  out.reset(new uint8_t[len]);
-
+  out.reset(new uint8_t[len+512]);
 
   Timer timer;
   int64_t encoded_size = lzCompress(buf, len, out.get());
@@ -1464,9 +1514,9 @@ int main(int argc, char const* argv[]) {
 
   //huffmanSpeed();
   //testShort();
-  testFSEEncoder();
+  //testFSEEncoder();
 
-  //testLz();
+  testLz();
   //tuneSettings();
 
   return 0;
