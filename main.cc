@@ -209,6 +209,34 @@ private:
   int position_ = 0;
 };
 
+void writeSmallValue(BitWriter& writer, int v) {
+  if (v < 16) {
+    writer.writeBit(0);
+    writer.writeBits(v, 4);
+  } else if (v < 48) {
+    writer.writeBits(0b10, 2);
+    writer.writeBits(v - 16, 5);
+  } else {
+    writer.writeBits(0b11, 2);
+    writer.writeBits(v, 8);
+  }
+}
+
+int readSmallValue(BitReader& br) {
+  br.refill();
+  if (br.readBit() == 0) {
+    br.refill();
+    return br.readBits(4);
+  }
+  br.refill();
+  if (br.readBit() == 0) {
+    br.refill();
+    return 16 + br.readBits(5);
+  }
+  br.refill();
+  return br.readBits(8);
+}
+
 const int kMaxHuffCodeLength = 11;
 
 class HuffmanEncoder {
@@ -278,7 +306,10 @@ public:
 
     // Sort leaf nodes into level order.  This is required
     // for both length limiting and writing the table.
-    std::sort(&nodes_[0], &nodes_[num_symbols], [](const Node& l, const Node& r){return l.freq < r.freq;});
+    std::sort(&nodes_[0], &nodes_[num_symbols], [](const Node& l, const Node& r){
+      if (l.freq != r.freq) return l.freq < r.freq;
+      return l.symbol < r.symbol;
+    });
 
     limitLength(num_symbols);
     writeTable(num_symbols);
@@ -298,9 +329,22 @@ private:
     const int kSymBits = log2(max_symbols_);
     writer_.writeBits(num_symbols - 1, kSymBits);
 
-    for (int i = 0; i < num_symbols; ++i) {
-      writer_.writeBits(nodes_[i].symbol, kSymBits);
-      writer_.writeBits(nodes_[i].freq - 1, 4);
+    int prev_symbol = -1;
+    for (int i = 0; i < num_symbols;) {
+      int codelen = nodes_[i].freq;
+      int run = 1;
+      while (i + run < num_symbols && nodes_[i + run].freq == codelen && run < 16) {
+        ++run;
+      }
+
+      writer_.writeBits(codelen - 1, 4);
+      writer_.writeBits(run - 1, 4);
+      for (int j = 0; j < run; ++j) {
+        int delta = nodes_[i + j].symbol - prev_symbol - 1;
+        writeSmallValue(writer_, delta);
+        prev_symbol = nodes_[i + j].symbol;
+      }
+      i += run;
     }
 
     // Byte align after the table
@@ -391,16 +435,22 @@ public:
 
     CHECK(num_symbols_ <= kMaxSymbols);
 
-    for (int i = 0; i < num_symbols_; ++i) {
+    int prev_symbol = -1;
+    for (int i = 0; i < num_symbols_;) {
       br_.refill();
-      int symbol = br_.readBits(sym_bits_);
       int codelen = br_.readBits(4) + 1;
-      LOGV(2, "sym:%d len:%d\n", symbol, codelen);
+      br_.refill();
+      int run = br_.readBits(4) + 1;
+      for (int j = 0; j < run; ++j) {
+        int symbol = prev_symbol + 1 + readSmallValue(br_);
+        LOGV(2, "sym:%d len:%d\n", symbol, codelen);
 
-      ++codelen_count_[codelen];
-      symbol_[i] = symbol;
-      min_codelen_ = std::min(min_codelen_, codelen);
-      max_codelen_ = std::max(max_codelen_, codelen);
+        ++codelen_count_[codelen];
+        symbol_[i++] = symbol;
+        min_codelen_ = std::min(min_codelen_, codelen);
+        max_codelen_ = std::max(max_codelen_, codelen);
+        prev_symbol = symbol;
+      }
     }
     LOGV(1, "num_sym %d codelen(min:%d, max:%d)\n", num_symbols_, min_codelen_, max_codelen_);
 
