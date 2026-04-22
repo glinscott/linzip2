@@ -312,6 +312,10 @@ public:
     });
 
     limitLength(num_symbols);
+    std::sort(&nodes_[0], &nodes_[num_symbols], [](const Node& l, const Node& r){
+      if (l.freq != r.freq) return l.freq < r.freq;
+      return l.symbol < r.symbol;
+    });
     writeTable(num_symbols);
     buildCodes(num_symbols);
   }
@@ -329,7 +333,6 @@ private:
     const int kSymBits = log2(max_symbols_);
     writer_.writeBits(num_symbols - 1, kSymBits);
 
-    int prev_symbol = -1;
     for (int i = 0; i < num_symbols;) {
       int codelen = nodes_[i].freq;
       int run = 1;
@@ -339,6 +342,7 @@ private:
 
       writer_.writeBits(codelen - 1, 4);
       writer_.writeBits(run - 1, 4);
+      int prev_symbol = -1;
       for (int j = 0; j < run; ++j) {
         int delta = nodes_[i + j].symbol - prev_symbol - 1;
         writeSmallValue(writer_, delta);
@@ -435,12 +439,12 @@ public:
 
     CHECK(num_symbols_ <= kMaxSymbols);
 
-    int prev_symbol = -1;
     for (int i = 0; i < num_symbols_;) {
       br_.refill();
       int codelen = br_.readBits(4) + 1;
       br_.refill();
       int run = br_.readBits(4) + 1;
+      int prev_symbol = -1;
       for (int j = 0; j < run; ++j) {
         int symbol = prev_symbol + 1 + readSmallValue(br_);
         LOGV(2, "sym:%d len:%d\n", symbol, codelen);
@@ -1103,18 +1107,22 @@ public:
       uint8_t* marker = out;
       out += 3;
 
-      HuffmanEncoder encoder(out);
-      for (int i = 0; i < num_lit_; ++i) {
-        encoder.scan(literals_[i]);
+      if (num_lit_ == 0) {
+        writeInt<3>(marker, 0);
+      } else {
+        HuffmanEncoder encoder(out);
+        for (int i = 0; i < num_lit_; ++i) {
+          encoder.scan(literals_[i]);
+        }
+        encoder.buildTable();
+        for (int i = 0; i < num_lit_; ++i) {
+          encoder.encode(literals_[i]);
+        }
+        int64_t bytes_written = encoder.finish();
+        out += bytes_written;
+        writeInt<3>(marker, bytes_written);
+        LOGV(1, "literals: %d -> %lld\n", num_lit_, bytes_written);
       }
-      encoder.buildTable();
-      for (int i = 0; i < num_lit_; ++i) {
-        encoder.encode(literals_[i]);
-      }
-      int64_t bytes_written = encoder.finish();
-      out += bytes_written;
-      writeInt<3>(marker, bytes_written);
-      LOGV(1, "literals: %d -> %lld\n", num_lit_, bytes_written);
     }
 
     // Write sequences section
@@ -1409,9 +1417,13 @@ public:
       buf += 6;
       LOGV(1, "Read %d literals, %d compressed bytes\n", num_literals, compressed_size);
 
-      HuffmanDecoder decoder(buf, buf + compressed_size);
-      decoder.readTable();
-      decoder.decode(literals, literals + num_literals);
+      if (num_literals == 0) {
+        CHECK(compressed_size == 0);
+      } else {
+        HuffmanDecoder decoder(buf, buf + compressed_size);
+        decoder.readTable();
+        decoder.decode(literals, literals + num_literals);
+      }
       buf += compressed_size;
     }
 
