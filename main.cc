@@ -22,15 +22,17 @@ struct Timer {
 };
 
 bool FLAG_test = false;
-int FLAG_level = 0;
+int FLAG_level = 1;
 int FLAG_window_size = 18;
 int FLAG_max_matches = 8;
 
 constexpr bool kUseFSE = true;
+constexpr bool kUseRepeatOffsets = true;
 
 ////////////
 
 constexpr int64_t kMaxChunkSize = 1 << 18; // 256k
+constexpr int kSequenceStateBits = 10;
 
 std::string toBinary(int v, int size) {
   std::string result;
@@ -516,25 +518,22 @@ void huffmanDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len)
 }
 
 void sortSymbols(int state_len, int num_symbols, int* freq, int* sorted_symbols) {
-  // http://fastcompression.blogspot.com/2014/02/fse-distributing-symbol-values.html
-  // http://cbloomrants.blogspot.com/2014/02/02-06-14-understanding-ans-8.html
-  std::pair<float, int> sorted[state_len];
-  int at = 0;
+  // Use the standard FSE table spread so the state space is well mixed.
+  int mask = state_len - 1;
+  int step = (state_len >> 1) + (state_len >> 3) + 3;
+  int pos = 0;
+  int written = 0;
+
   for (int symbol = 0; symbol < num_symbols; ++symbol) {
-    int count = freq[symbol];
-    if (count == 0)
-      continue;
-    float invp = 1.0f / count;
-    for (int j = 0; j < count; ++j) {
-      sorted[at].second = symbol;
-      sorted[at].first = invp + j * invp;
-      ++at;
+    for (int i = 0; i < freq[symbol]; ++i) {
+      sorted_symbols[pos] = symbol;
+      pos = (pos + step) & mask;
+      ++written;
     }
   }
-  CHECK(at == state_len);
-  std::stable_sort(&sorted[0], &sorted[state_len]);
-  for (int i = 0; i < state_len; ++i)
-    sorted_symbols[i] = sorted[i].second;
+
+  CHECK(written == state_len);
+  CHECK(pos == 0);
 }
 
 class FSEEncoder {
@@ -626,28 +625,67 @@ private:
     for (int i = 0; i < max_symbols_; ++i)
       total += freq_[i];
 
-    // normalization
+    /*
+    double expected = 0;
+    for (int i = 0; i < max_symbols_; ++i) {
+      if (freq_[i] == 0) continue;
+      double v= -log(freq_[i] / double(total)) / log(2);
+      printf("Freq:%d Bits %lf\n", freq_[i], v);
+      expected += v * freq_[i];
+    }
+    printf("Expected %lf\n", expected / 8);
+    */
+
+    int raw_freq[256];
+    memcpy(raw_freq, freq_, sizeof(raw_freq));
+
+    // Normalize with an initial round-to-nearest pass.
     int new_total = 0;
-    int max_freq = 0;
-    int max_freq_i = 0;
     for (int symbol = 0; symbol < max_symbols_; ++symbol) {
-      uint64_t c = freq_[symbol];
+      uint64_t c = raw_freq[symbol];
       if (c == 0)
         continue;
-      if (c > max_freq) {
-        max_freq = c;
-        max_freq_i = symbol;
-      }
-      freq_[symbol] = std::max(1, int(((c << state_bits_) + (total / 2)) / total));
+      freq_[symbol] = std::max(1, int((c * state_len_ + (total / 2)) / total));
       LOGV(2, "scaled_freq[%d] = %d\n", symbol, freq_[symbol]);
       new_total += freq_[symbol];
     }
 
-    // Distribute any remaining error to the largest symbol (not optimal - but it works).
-    int err = new_total - state_len_;
-    LOGV(2, "normalization error: %d\n", err);
-    CHECK(err < freq_[max_freq_i]);
-    freq_[max_freq_i] -= err;
+    // Fix the residual rounding error by choosing the adjustment with the
+    // smallest change in coding cost each time.
+    int correction = state_len_ - new_total;
+    LOGV(2, "normalization correction: %d\n", correction);
+    while (correction != 0) {
+      int best_symbol = -1;
+      double best_score = correction > 0 ? -1e30 : 1e30;
+
+      for (int symbol = 0; symbol < max_symbols_; ++symbol) {
+        int raw = raw_freq[symbol];
+        int norm = freq_[symbol];
+        if (raw == 0)
+          continue;
+        if (correction < 0 && norm <= 1)
+          continue;
+
+        double score;
+        if (correction > 0) {
+          score = raw * std::log((norm + 1.0) / norm);
+          if (score > best_score) {
+            best_score = score;
+            best_symbol = symbol;
+          }
+        } else {
+          score = raw * std::log(norm / double(norm - 1));
+          if (score < best_score) {
+            best_score = score;
+            best_symbol = symbol;
+          }
+        }
+      }
+
+      CHECK(best_symbol != -1);
+      freq_[best_symbol] += correction > 0 ? 1 : -1;
+      correction += correction > 0 ? -1 : 1;
+    }
   }
 
   ReverseBitWriter writer_;
@@ -899,6 +937,69 @@ int offsetExtra(int offset) {
   return offset - (1 << log2(offset));
 }
 
+struct RepOffsets {
+  int rep[3] = {1, 4, 8};
+};
+
+int offsetSymbol(int offset, RepOffsets& reps) {
+  if (!kUseRepeatOffsets) {
+    return offsetCode(offset);
+  }
+  if (offset == 0) {
+    return 0;
+  }
+  if (offset == reps.rep[0]) {
+    return 1;
+  }
+  if (offset == reps.rep[1]) {
+    std::swap(reps.rep[0], reps.rep[1]);
+    return 2;
+  }
+  if (offset == reps.rep[2]) {
+    int dist = reps.rep[2];
+    reps.rep[2] = reps.rep[1];
+    reps.rep[1] = reps.rep[0];
+    reps.rep[0] = dist;
+    return 3;
+  }
+
+  reps.rep[2] = reps.rep[1];
+  reps.rep[1] = reps.rep[0];
+  reps.rep[0] = offset;
+  return 3 + offsetCode(offset);
+}
+
+int decodeOffsetSymbol(int symbol, RepOffsets& reps) {
+  if (!kUseRepeatOffsets) {
+    return symbol;
+  }
+  if (symbol == 0) {
+    return 0;
+  }
+  if (symbol == 1) {
+    return reps.rep[0];
+  }
+  if (symbol == 2) {
+    int dist = reps.rep[1];
+    std::swap(reps.rep[0], reps.rep[1]);
+    return dist;
+  }
+  if (symbol == 3) {
+    int dist = reps.rep[2];
+    reps.rep[2] = reps.rep[1];
+    reps.rep[1] = reps.rep[0];
+    reps.rep[0] = dist;
+    return dist;
+  }
+
+  int code = symbol - 3;
+  int dist = code < 2 ? code : (1 << (code - 1));
+  reps.rep[2] = reps.rep[1];
+  reps.rep[1] = reps.rep[0];
+  reps.rep[0] = dist;
+  return dist;
+}
+
 template<int bytes>
 int readInt(uint8_t* buf) {
   int v = 0;
@@ -916,16 +1017,6 @@ void writeInt(uint8_t* buf, int v) {
   }
 }
 
-int literal_price(int c) {
-  return 6;
-}
-
-int match_price(int len, int dist) {
-  int len_cost = 6 + log2(len);
-  int dist_cost = std::max(0, log2(dist) - 3);
-  return len_cost + dist_cost;
-}
-
 class LzEncoder {
 public:
   // Initializes encoder with a backwards window of `window_size`.  Must be a power of 2!
@@ -939,9 +1030,6 @@ public:
   // Returns number of bytes written to `out`.
   int64_t encode(uint8_t* buffer, int64_t p, int64_t p_end, uint8_t* out) {
     uint8_t* out_start = out;
-
-    num_seq_ = 0;
-    num_lit_ = 0;
 
     if (level_ == 0) {
       fastParse(buffer, p, p_end);
@@ -965,7 +1053,6 @@ public:
       uint8_t* marker = out;
       out += 3;
 
-      // Huffman table for literals
       HuffmanEncoder encoder(out);
       for (int i = 0; i < num_lit_; ++i) {
         encoder.scan(literals_[i]);
@@ -988,7 +1075,7 @@ public:
     int lit_len_out = writeValues<false>(out, literal_lengths_);
     out += lit_len_out;
     // b. Match offsets
-    int match_offsets_out = writeValues<true>(out, match_offsets_);
+    int match_offsets_out = writeOffsets(out);
     out += match_offsets_out;
     // c. Match lengths
     int match_lengths_out = writeValues<false>(out, match_lengths_);
@@ -1001,7 +1088,42 @@ public:
   }
 
 private:
+  int literalBytePrice(int c) {
+    return 6;
+  }
+
+  int literalLengthPrice(int len) {
+    return 1 + log2(len + 1);
+  }
+
+  int matchLengthPrice(int len) {
+    return 2 + log2(len + 1);
+  }
+
+  int offsetPrice(int dist, RepOffsets reps) {
+    if (!kUseRepeatOffsets) {
+      return 2 + log2(std::max(1, dist));
+    }
+    if (dist == 0) {
+      return 1;
+    }
+    if (dist == reps.rep[0] || dist == reps.rep[1] || dist == reps.rep[2]) {
+      return 1;
+    }
+    return 2 + log2(dist);
+  }
+
+  struct ParseStep {
+    int prev = -1;
+    int step_kind = 0; // 0=start, 1=literal, 2=match
+    uint8_t literal = 0;
+    int match_len = 0;
+    int match_dist = 0;
+  };
+
   void fastParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+    num_seq_ = 0;
+    num_lit_ = 0;
     const int kMinMatchLen = 5;
     int num_literals = 0;
 
@@ -1033,23 +1155,34 @@ private:
   }
 
   void optimalParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+    num_seq_ = 0;
+    num_lit_ = 0;
     int64_t length = p_end - p;
-    std::vector<int> price(length + 1, 999999999);
-    std::vector<int> len(length + 1, 0);
-    std::vector<int> dist(length + 1, 0);
+    // Keep one winning parser state per position.  This captures the current
+    // rep-offset history and pending literal run without the cost of a beam.
+    std::vector<int> cost(length + 1, 999999999);
+    std::vector<int> pending_literals(length + 1, 0);
+    std::vector<RepOffsets> reps(length + 1);
+    std::vector<ParseStep> steps(length + 1);
 
-    price[0] = 0;
+    cost[0] = 0;
+    reps[0] = RepOffsets();
 
-    // Forward pass, calculate best price for literal or match at each position.
     for (int64_t i = 0; i < length; ++i) {
-      int lit_cost = price[i] + literal_price(buffer[i]);
-      if (lit_cost < price[i + 1]) {
-        price[i + 1] = lit_cost;
-        len[i + 1] = 1;
-        dist[i + 1] = 0;
+      if (cost[i] == 999999999) {
+        continue;
       }
 
-      // Don't try matches close to end of buffer.
+      int lit_cost = cost[i] + literalBytePrice(buffer[p + i]);
+      if (lit_cost < cost[i + 1]) {
+        cost[i + 1] = lit_cost;
+        pending_literals[i + 1] = pending_literals[i] + 1;
+        reps[i + 1] = reps[i];
+        steps[i + 1].prev = i;
+        steps[i + 1].step_kind = 1;
+        steps[i + 1].literal = buffer[p + i];
+      }
+
       if (i + 4 >= length) {
         continue;
       }
@@ -1057,48 +1190,104 @@ private:
       int64_t match_dist[16], match_len[16];
       int matches = matcher_.findMatches(buffer, buffer + p_end, p + i, match_dist, match_len);
       for (int j = 0; j < matches; ++j) {
-        int match_cost = price[i] + match_price(match_len[j], match_dist[j]);
-        if (match_cost < price[i+ match_len[j]]) {
-          price[i + match_len[j]] = match_cost;
-          len[i + match_len[j]] = match_len[j];
-          dist[i + match_len[j]] = match_dist[j];
+        RepOffsets next_reps = reps[i];
+        // Closing the current literal run here makes the match cost line up
+        // with the sequence format we actually write.
+        int match_cost = cost[i]
+                       + literalLengthPrice(pending_literals[i])
+                       + offsetPrice(match_dist[j], next_reps)
+                       + matchLengthPrice(match_len[j]);
+        int next = i + match_len[j];
+        if (match_cost < cost[next]) {
+          cost[next] = match_cost;
+          pending_literals[next] = 0;
+          offsetSymbol(match_dist[j], next_reps);
+          reps[next] = next_reps;
+          steps[next].prev = i;
+          steps[next].step_kind = 2;
+          steps[next].match_len = match_len[j];
+          steps[next].match_dist = match_dist[j];
         }
       }
     }
 
-    // Backward pass, pick best option at each step.
-    if (len[length] <= 1) {
-      match_offsets_[num_seq_] = 0;
-      match_lengths_[num_seq_] = 0;
-      literal_lengths_[num_seq_] = 0;
-      ++num_seq_;
+    CHECK(cost[length] != 999999999);
+    std::vector<int> path_positions;
+    for (int pos = length; pos != 0; pos = steps[pos].prev) {
+      path_positions.push_back(pos);
     }
-    for (int64_t i = length; i > 0;) {
-      if (len[i] > 1) {
-        match_offsets_[num_seq_] = dist[i];
-        match_lengths_[num_seq_] = len[i];
-        literal_lengths_[num_seq_] = 0;
+    std::reverse(path_positions.begin(), path_positions.end());
+
+    int num_literals = 0;
+    for (int pos : path_positions) {
+      const ParseStep& state = steps[pos];
+      if (state.step_kind == 1) {
+        literals_[num_lit_++] = state.literal;
+        ++num_literals;
+      } else if (state.step_kind == 2) {
+        literal_lengths_[num_seq_] = num_literals;
+        match_offsets_[num_seq_] = state.match_dist;
+        match_lengths_[num_seq_] = state.match_len;
         ++num_seq_;
-        i -= len[i];
-      } else {
-        literals_[num_lit_++] = buffer[p + i - 1];
-        ++literal_lengths_[num_seq_ - 1];
-        --i;
+        num_literals = 0;
       }
     }
+    if (num_literals != 0 || num_seq_ == 0) {
+      literal_lengths_[num_seq_] = num_literals;
+      match_offsets_[num_seq_] = 0;
+      match_lengths_[num_seq_] = 0;
+      ++num_seq_;
+    }
+  }
 
-    // We wrote the arrays in reverse, flip them for uniformity.
-    std::reverse(&literal_lengths_[0], &literal_lengths_[num_seq_]);
-    std::reverse(&match_offsets_[0], &match_offsets_[num_seq_]);
-    std::reverse(&match_lengths_[0], &match_lengths_[num_seq_]);
-    std::reverse(&literals_[0], &literals_[num_lit_]);
+  int64_t writeOffsets(uint8_t* out) {
+    RepOffsets reps;
+    for (int i = 0; i < num_seq_; ++i) {
+      offset_symbols_[i] = offsetSymbol(match_offsets_[i], reps);
+    }
+
+    if (kUseFSE) {
+      uint8_t* end = scratch + kMaxChunkSize;
+      FSEEncoder encoder(end, 64, kSequenceStateBits);
+      for (int i = 0; i < num_seq_; ++i) {
+        encoder.scan(offset_symbols_[i]);
+      }
+      encoder.buildTable();
+      for (int64_t i = num_seq_ - 1; i >= 0; --i) {
+        int offset = match_offsets_[i];
+        int symbol = offset_symbols_[i];
+        if (symbol >= 4) {
+          encoder.writer().writeBits(offsetExtra(offset), log2(offset));
+        }
+        encoder.encode(symbol);
+      }
+      int64_t encoded_size = encoder.finish();
+      int64_t table_size = encoder.writeTable(out);
+      memmove(out + table_size, end - encoded_size, encoded_size);
+      return table_size + encoded_size;
+    } else {
+      HuffmanEncoder encoder(out, 64);
+      for (int i = 0; i < num_seq_; ++i) {
+        encoder.scan(offset_symbols_[i]);
+      }
+      encoder.buildTable();
+      for (int i = 0; i < num_seq_; ++i) {
+        int offset = match_offsets_[i];
+        int symbol = offset_symbols_[i];
+        encoder.encode(symbol);
+        if (symbol >= 4) {
+          encoder.writer().writeBits(offsetExtra(offset), log2(offset));
+        }
+      }
+      return encoder.finish();
+    }
   }
 
   template<bool is_offset>
   int64_t writeValues(uint8_t* out, const int* values) {
     if (kUseFSE) {
       uint8_t* end = scratch + kMaxChunkSize;
-      FSEEncoder encoder(end, 32, 9);
+      FSEEncoder encoder(end, 32, kSequenceStateBits);
       for (int i = 0; i < num_seq_; ++i) {
         encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
       }
@@ -1117,6 +1306,7 @@ private:
       int64_t encoded_size = encoder.finish();
       int64_t table_size = encoder.writeTable(out);
       memmove(out + table_size, end - encoded_size, encoded_size);
+      //printf("FSEBlock tot: %lld table:%lld encoded:%lld\n", table_size+encoded_size, table_size, encoded_size);
       return table_size + encoded_size;
     } else {
       HuffmanEncoder encoder(out, 32);
@@ -1124,6 +1314,7 @@ private:
         encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
       }
       encoder.buildTable();
+      int64_t table_size = encoder.writer().finish();
       for (int i = 0; i < num_seq_; ++i) {
         int v = values[i];
         encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
@@ -1135,7 +1326,9 @@ private:
           encoder.writer().writeBits(extra, log2(v));
         }
       }
-      return encoder.finish();
+      int64_t tot = encoder.finish();
+      //printf("Hufblock tot: %lld table:%lld encoded:%lld\n", tot, table_size, tot-table_size);
+      return tot;
     }
   }
 
@@ -1145,6 +1338,7 @@ private:
   int num_seq_;
   int num_lit_;
   uint8_t literals_[kMaxChunkSize];
+  int offset_symbols_[kMaxChunkSize / 4];
   int match_offsets_[kMaxChunkSize / 4];
   int match_lengths_[kMaxChunkSize / 4];
   int literal_lengths_[kMaxChunkSize / 4];
@@ -1176,7 +1370,7 @@ public:
     LOGV(1, "Read %d sequences\n", num_seq);
 
     buf += decodeValues<false>(buf, end, num_seq, literal_lengths);
-    buf += decodeValues<true>(buf, end, num_seq, match_offsets);
+    buf += decodeOffsets(buf, end, num_seq, match_offsets);
     buf += decodeValues<false>(buf, end, num_seq, match_lengths);
 
     uint8_t* l_head = literals;
@@ -1195,6 +1389,62 @@ public:
   }
 
 private:
+  int64_t decodeOffsets(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
+    RepOffsets reps;
+    if (kUseFSE) {
+      FSEDecoder decoder(buf, end);
+      decoder.readTable();
+      for (int i = 0; i < num_seq; ++i) {
+        int symbol = decoder.decodeOne();
+        int value = decodeOffsetSymbol(symbol, reps);
+        if (kUseRepeatOffsets) {
+          if (symbol >= 4) {
+            int extra_bits = symbol - 4;
+            if (extra_bits > 0) {
+              decoder.br().refill();
+              value |= decoder.br().readBits(extra_bits);
+            }
+            reps.rep[0] = value;
+          }
+        } else if (symbol >= 2) {
+          int extra_bits = symbol - 1;
+          value = 1 << extra_bits;
+          decoder.br().refill();
+          value |= decoder.br().readBits(extra_bits);
+        }
+        values[i] = value;
+      }
+      decoder.br().byteAlign();
+      return decoder.br().cursor() - buf;
+    } else {
+      const int kSymBits = 6;
+      HuffmanDecoder decoder(buf, end, kSymBits);
+      decoder.readTable();
+      for (int i = 0; i < num_seq; ++i) {
+        int symbol = decoder.decodeOne();
+        int value = decodeOffsetSymbol(symbol, reps);
+        if (kUseRepeatOffsets) {
+          if (symbol >= 4) {
+            int extra_bits = symbol - 4;
+            if (extra_bits > 0) {
+              decoder.br().refill();
+              value |= decoder.br().readBits(extra_bits);
+            }
+            reps.rep[0] = value;
+          }
+        } else if (symbol >= 2) {
+          int extra_bits = symbol - 1;
+          value = 1 << extra_bits;
+          decoder.br().refill();
+          value |= decoder.br().readBits(extra_bits);
+        }
+        values[i] = value;
+      }
+      decoder.br().byteAlign();
+      return decoder.br().cursor() - buf;
+    }
+  }
+
   template<bool is_offset>
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
     if (kUseFSE) {
@@ -1268,8 +1518,8 @@ void lzDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len) {
 }
 
 std::unique_ptr<uint8_t> readEnwik8(int64_t& len) {
-  FILE* f = fopen("enwik8", "r");
-  // FILE* f = fopen("data/silesia.tar", "r");
+  //FILE* f = fopen("enwik8", "r");
+  FILE* f = fopen("data/silesia.tar", "r");
   fseek(f, 0, SEEK_END);
   len = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -1407,6 +1657,7 @@ void testLz() {
 
   std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
   buf = enwik8.get();
+  len = 1000000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len+512]);
