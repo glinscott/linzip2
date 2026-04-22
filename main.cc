@@ -25,9 +25,12 @@ bool FLAG_test = false;
 int FLAG_level = 1;
 int FLAG_window_size = 18;
 int FLAG_max_matches = 8;
-
-constexpr bool kUseFSE = true;
-constexpr bool kUseRepeatOffsets = true;
+bool FLAG_use_fse = true;
+bool FLAG_use_repeat_offsets = true;
+bool FLAG_use_stateful_parser = true;
+bool FLAG_use_compact_huffman_tables = true;
+const char* FLAG_input_path = "enwik8";
+constexpr int64_t kLocalExperimentBytes = 10000000;
 
 ////////////
 
@@ -333,22 +336,29 @@ private:
     const int kSymBits = log2(max_symbols_);
     writer_.writeBits(num_symbols - 1, kSymBits);
 
-    for (int i = 0; i < num_symbols;) {
-      int codelen = nodes_[i].freq;
-      int run = 1;
-      while (i + run < num_symbols && nodes_[i + run].freq == codelen && run < 16) {
-        ++run;
-      }
+    if (FLAG_use_compact_huffman_tables) {
+      for (int i = 0; i < num_symbols;) {
+        int codelen = nodes_[i].freq;
+        int run = 1;
+        while (i + run < num_symbols && nodes_[i + run].freq == codelen && run < 16) {
+          ++run;
+        }
 
-      writer_.writeBits(codelen - 1, 4);
-      writer_.writeBits(run - 1, 4);
-      int prev_symbol = -1;
-      for (int j = 0; j < run; ++j) {
-        int delta = nodes_[i + j].symbol - prev_symbol - 1;
-        writeSmallValue(writer_, delta);
-        prev_symbol = nodes_[i + j].symbol;
+        writer_.writeBits(codelen - 1, 4);
+        writer_.writeBits(run - 1, 4);
+        int prev_symbol = -1;
+        for (int j = 0; j < run; ++j) {
+          int delta = nodes_[i + j].symbol - prev_symbol - 1;
+          writeSmallValue(writer_, delta);
+          prev_symbol = nodes_[i + j].symbol;
+        }
+        i += run;
       }
-      i += run;
+    } else {
+      for (int i = 0; i < num_symbols; ++i) {
+        writer_.writeBits(nodes_[i].symbol, kSymBits);
+        writer_.writeBits(nodes_[i].freq - 1, 4);
+      }
     }
 
     // Byte align after the table
@@ -439,21 +449,35 @@ public:
 
     CHECK(num_symbols_ <= kMaxSymbols);
 
-    for (int i = 0; i < num_symbols_;) {
-      br_.refill();
-      int codelen = br_.readBits(4) + 1;
-      br_.refill();
-      int run = br_.readBits(4) + 1;
-      int prev_symbol = -1;
-      for (int j = 0; j < run; ++j) {
-        int symbol = prev_symbol + 1 + readSmallValue(br_);
+    if (FLAG_use_compact_huffman_tables) {
+      for (int i = 0; i < num_symbols_;) {
+        br_.refill();
+        int codelen = br_.readBits(4) + 1;
+        br_.refill();
+        int run = br_.readBits(4) + 1;
+        int prev_symbol = -1;
+        for (int j = 0; j < run; ++j) {
+          int symbol = prev_symbol + 1 + readSmallValue(br_);
+          LOGV(2, "sym:%d len:%d\n", symbol, codelen);
+
+          ++codelen_count_[codelen];
+          symbol_[i++] = symbol;
+          min_codelen_ = std::min(min_codelen_, codelen);
+          max_codelen_ = std::max(max_codelen_, codelen);
+          prev_symbol = symbol;
+        }
+      }
+    } else {
+      for (int i = 0; i < num_symbols_; ++i) {
+        br_.refill();
+        int symbol = br_.readBits(sym_bits_);
+        int codelen = br_.readBits(4) + 1;
         LOGV(2, "sym:%d len:%d\n", symbol, codelen);
 
         ++codelen_count_[codelen];
-        symbol_[i++] = symbol;
+        symbol_[i] = symbol;
         min_codelen_ = std::min(min_codelen_, codelen);
         max_codelen_ = std::max(max_codelen_, codelen);
-        prev_symbol = symbol;
       }
     }
     LOGV(1, "num_sym %d codelen(min:%d, max:%d)\n", num_symbols_, min_codelen_, max_codelen_);
@@ -996,7 +1020,7 @@ struct RepOffsets {
 };
 
 int offsetSymbol(int offset, RepOffsets& reps) {
-  if (!kUseRepeatOffsets) {
+  if (!FLAG_use_repeat_offsets) {
     return offsetCode(offset);
   }
   if (offset == 0) {
@@ -1024,7 +1048,7 @@ int offsetSymbol(int offset, RepOffsets& reps) {
 }
 
 int decodeOffsetSymbol(int symbol, RepOffsets& reps) {
-  if (!kUseRepeatOffsets) {
+  if (!FLAG_use_repeat_offsets) {
     return symbol;
   }
   if (symbol == 0) {
@@ -1088,7 +1112,11 @@ public:
     if (level_ == 0) {
       fastParse(buffer, p, p_end);
     } else if (level_ == 1) {
-      optimalParse(buffer, p, p_end);
+      if (FLAG_use_stateful_parser) {
+        optimalParse(buffer, p, p_end);
+      } else {
+        legacyOptimalParse(buffer, p, p_end);
+      }
     }
 
     if (kDebugLevel >= 3) {
@@ -1158,8 +1186,12 @@ private:
     return 2 + log2(len + 1);
   }
 
+  int matchPrice(int len, int dist) {
+    return 3 + log2(std::max(1, len)) + log2(std::max(1, dist));
+  }
+
   int offsetPrice(int dist, RepOffsets reps) {
-    if (!kUseRepeatOffsets) {
+    if (!FLAG_use_repeat_offsets) {
       return 2 + log2(std::max(1, dist));
     }
     if (dist == 0) {
@@ -1210,6 +1242,67 @@ private:
       match_lengths_[num_seq_] = 0;
       ++num_seq_;
     }
+  }
+
+  void legacyOptimalParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+    num_seq_ = 0;
+    num_lit_ = 0;
+    int64_t length = p_end - p;
+    std::vector<int> price(length + 1, 999999999);
+    std::vector<int> len(length + 1, 0);
+    std::vector<int> dist(length + 1, 0);
+
+    price[0] = 0;
+
+    for (int64_t i = 0; i < length; ++i) {
+      int lit_cost = price[i] + literalBytePrice(buffer[p + i]);
+      if (lit_cost < price[i + 1]) {
+        price[i + 1] = lit_cost;
+        len[i + 1] = 1;
+        dist[i + 1] = 0;
+      }
+
+      if (i + 4 >= length) {
+        continue;
+      }
+
+      int64_t match_dist[16], match_len[16];
+      int matches = matcher_.findMatches(buffer, buffer + p_end, p + i, match_dist, match_len);
+      for (int j = 0; j < matches; ++j) {
+        int match_cost = price[i] + matchPrice(match_len[j], match_dist[j]);
+        int next = i + match_len[j];
+        if (match_cost < price[next]) {
+          price[next] = match_cost;
+          len[next] = match_len[j];
+          dist[next] = match_dist[j];
+        }
+      }
+    }
+
+    if (len[length] <= 1) {
+      match_offsets_[num_seq_] = 0;
+      match_lengths_[num_seq_] = 0;
+      literal_lengths_[num_seq_] = 0;
+      ++num_seq_;
+    }
+    for (int64_t i = length; i > 0;) {
+      if (len[i] > 1) {
+        match_offsets_[num_seq_] = dist[i];
+        match_lengths_[num_seq_] = len[i];
+        literal_lengths_[num_seq_] = 0;
+        ++num_seq_;
+        i -= len[i];
+      } else {
+        literals_[num_lit_++] = buffer[p + i - 1];
+        ++literal_lengths_[num_seq_ - 1];
+        --i;
+      }
+    }
+
+    std::reverse(&literal_lengths_[0], &literal_lengths_[num_seq_]);
+    std::reverse(&match_offsets_[0], &match_offsets_[num_seq_]);
+    std::reverse(&match_lengths_[0], &match_lengths_[num_seq_]);
+    std::reverse(&literals_[0], &literals_[num_lit_]);
   }
 
   void optimalParse(uint8_t* buffer, int64_t p, int64_t p_end) {
@@ -1299,72 +1392,136 @@ private:
   }
 
   template<typename ScanSymbolFn, typename EncodeSymbolFn>
-  int64_t writeSymbolStream(uint8_t* out, int max_symbols,
-                            ScanSymbolFn scan_symbol,
-                            EncodeSymbolFn encode_symbol) {
-    if (kUseFSE) {
-      uint8_t* end = scratch + kMaxChunkSize;
-      FSEEncoder encoder(end, max_symbols, kSequenceStateBits);
-      for (int i = 0; i < num_seq_; ++i) {
-        encoder.scan(scan_symbol(i));
-      }
-      encoder.buildTable();
-      for (int64_t i = num_seq_ - 1; i >= 0; --i) {
-        encode_symbol(encoder, i);
-      }
-      int64_t encoded_size = encoder.finish();
-      int64_t table_size = encoder.writeTable(out);
-      memmove(out + table_size, end - encoded_size, encoded_size);
-      return table_size + encoded_size;
-    } else {
-      HuffmanEncoder encoder(out, max_symbols);
-      for (int i = 0; i < num_seq_; ++i) {
-        encoder.scan(scan_symbol(i));
-      }
-      encoder.buildTable();
-      for (int i = 0; i < num_seq_; ++i) {
-        encode_symbol(encoder, i);
-      }
-      return encoder.finish();
+  int64_t writeFSEStream(uint8_t* out, int max_symbols,
+                         ScanSymbolFn scan_symbol,
+                         EncodeSymbolFn encode_symbol) {
+    uint8_t* end = scratch + kMaxChunkSize;
+    FSEEncoder encoder(end, max_symbols, kSequenceStateBits);
+    for (int i = 0; i < num_seq_; ++i) {
+      encoder.scan(scan_symbol(i));
+    }
+    encoder.buildTable();
+    for (int64_t i = num_seq_ - 1; i >= 0; --i) {
+      encode_symbol(encoder, i);
+    }
+    int64_t encoded_size = encoder.finish();
+    int64_t table_size = encoder.writeTable(out);
+    memmove(out + table_size, end - encoded_size, encoded_size);
+    return table_size + encoded_size;
+  }
+
+  template<typename ScanSymbolFn, typename EncodeSymbolFn>
+  int64_t writeHuffmanStream(uint8_t* out, int max_symbols,
+                             ScanSymbolFn scan_symbol,
+                             EncodeSymbolFn encode_symbol) {
+    HuffmanEncoder encoder(out, max_symbols);
+    for (int i = 0; i < num_seq_; ++i) {
+      encoder.scan(scan_symbol(i));
+    }
+    encoder.buildTable();
+    for (int i = 0; i < num_seq_; ++i) {
+      encode_symbol(encoder, i);
+    }
+    return encoder.finish();
+  }
+
+  template<typename Encoder>
+  void emitFSESymbol(Encoder& encoder, int symbol, int extra, int extra_bits) {
+    if (extra_bits > 0) {
+      encoder.writer().writeBits(extra, extra_bits);
+    }
+    encoder.encode(symbol);
+  }
+
+  template<typename Encoder>
+  void emitHuffmanSymbol(Encoder& encoder, int symbol, int extra, int extra_bits) {
+    encoder.encode(symbol);
+    if (extra_bits > 0) {
+      encoder.writer().writeBits(extra, extra_bits);
     }
   }
 
-  int64_t writeOffsets(uint8_t* out) {
+  template<typename WriteStreamFn, typename EmitSymbolFn>
+  int64_t writeOffsetsImpl(uint8_t* out,
+                           WriteStreamFn write_stream,
+                           EmitSymbolFn emit_symbol) {
     RepOffsets reps;
     for (int i = 0; i < num_seq_; ++i) {
       offset_symbols_[i] = offsetSymbol(match_offsets_[i], reps);
     }
 
-    return writeSymbolStream(out, 64,
+    return write_stream(out, 64,
       [&](int i) {
         return offset_symbols_[i];
       },
       [&](auto& encoder, int i) {
         int offset = match_offsets_[i];
         int symbol = offset_symbols_[i];
-        if (symbol >= 4) {
-          encoder.writer().writeBits(offsetExtra(offset), log2(offset));
-        }
-        encoder.encode(symbol);
+        int extra_bits = symbol >= 4 ? log2(offset) : 0;
+        int extra = extra_bits > 0 ? offsetExtra(offset) : 0;
+        emit_symbol(encoder, symbol, extra, extra_bits);
       });
   }
 
-  template<bool is_offset>
-  int64_t writeValues(uint8_t* out, const int* values) {
-    return writeSymbolStream(out, 32,
+  template<bool is_offset, typename WriteStreamFn, typename EmitSymbolFn>
+  int64_t writeValuesImpl(uint8_t* out, const int* values,
+                          WriteStreamFn write_stream,
+                          EmitSymbolFn emit_symbol) {
+    return write_stream(out, 32,
       [&](int i) {
         return is_offset ? offsetCode(values[i]) : lengthCode(values[i]);
       },
       [&](auto& encoder, int i) {
         int v = values[i];
-        if (v >= (is_offset ? 2 : 16)) {
-          int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
-          encoder.writer().writeBits(extra, log2(v));
-        }
-        encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
+        int symbol = is_offset ? offsetCode(v) : lengthCode(v);
+        int extra_bits = v >= (is_offset ? 2 : 16) ? log2(v) : 0;
+        int extra = extra_bits > 0 ? (is_offset ? offsetExtra(v) : lengthExtra(v)) : 0;
+        emit_symbol(encoder, symbol, extra, extra_bits);
         LOGV(3, "Encoding %d -> %d (%d, %d)\n",
-             v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
+             v, symbol, log2(v),
              is_offset ? offsetExtra(v) : lengthExtra(v));
+      });
+  }
+
+  int64_t writeOffsets(uint8_t* out) {
+    if (!FLAG_use_repeat_offsets) {
+      return writeValues<true>(out, match_offsets_);
+    }
+    if (FLAG_use_fse) {
+      return writeOffsetsImpl(out,
+        [&](auto* stream_out, int max_symbols, auto scan_symbol, auto encode_symbol) {
+          return writeFSEStream(stream_out, max_symbols, scan_symbol, encode_symbol);
+        },
+        [&](auto& encoder, int symbol, int extra, int extra_bits) {
+          emitFSESymbol(encoder, symbol, extra, extra_bits);
+        });
+    }
+    return writeOffsetsImpl(out,
+      [&](auto* stream_out, int max_symbols, auto scan_symbol, auto encode_symbol) {
+        return writeHuffmanStream(stream_out, max_symbols, scan_symbol, encode_symbol);
+      },
+      [&](auto& encoder, int symbol, int extra, int extra_bits) {
+        emitHuffmanSymbol(encoder, symbol, extra, extra_bits);
+      });
+  }
+
+  template<bool is_offset>
+  int64_t writeValues(uint8_t* out, const int* values) {
+    if (FLAG_use_fse) {
+      return writeValuesImpl<is_offset>(out, values,
+        [&](auto* stream_out, int max_symbols, auto scan_symbol, auto encode_symbol) {
+          return writeFSEStream(stream_out, max_symbols, scan_symbol, encode_symbol);
+        },
+        [&](auto& encoder, int symbol, int extra, int extra_bits) {
+          emitFSESymbol(encoder, symbol, extra, extra_bits);
+        });
+    }
+    return writeValuesImpl<is_offset>(out, values,
+      [&](auto* stream_out, int max_symbols, auto scan_symbol, auto encode_symbol) {
+        return writeHuffmanStream(stream_out, max_symbols, scan_symbol, encode_symbol);
+      },
+      [&](auto& encoder, int symbol, int extra, int extra_bits) {
+        emitHuffmanSymbol(encoder, symbol, extra, extra_bits);
       });
   }
 
@@ -1441,26 +1598,23 @@ private:
   }
 
   int64_t decodeOffsets(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
+    if (!FLAG_use_repeat_offsets) {
+      return decodeValues<true>(buf, end, num_seq, values);
+    }
+
     RepOffsets reps;
-    if (kUseFSE) {
+    if (FLAG_use_fse) {
       FSEDecoder decoder(buf, end);
       return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int symbol = decoder.decodeOne();
         int value = decodeOffsetSymbol(symbol, reps);
-        if (kUseRepeatOffsets) {
-          if (symbol >= 4) {
-            int extra_bits = symbol - 4;
-            if (extra_bits > 0) {
-              decoder.br().refill();
-              value |= decoder.br().readBits(extra_bits);
-            }
-            reps.rep[0] = value;
+        if (symbol >= 4) {
+          int extra_bits = symbol - 4;
+          if (extra_bits > 0) {
+            decoder.br().refill();
+            value |= decoder.br().readBits(extra_bits);
           }
-        } else if (symbol >= 2) {
-          int extra_bits = symbol - 1;
-          value = 1 << extra_bits;
-          decoder.br().refill();
-          value |= decoder.br().readBits(extra_bits);
+          reps.rep[0] = value;
         }
         return value;
       });
@@ -1470,20 +1624,13 @@ private:
       return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int symbol = decoder.decodeOne();
         int value = decodeOffsetSymbol(symbol, reps);
-        if (kUseRepeatOffsets) {
-          if (symbol >= 4) {
-            int extra_bits = symbol - 4;
-            if (extra_bits > 0) {
-              decoder.br().refill();
-              value |= decoder.br().readBits(extra_bits);
-            }
-            reps.rep[0] = value;
+        if (symbol >= 4) {
+          int extra_bits = symbol - 4;
+          if (extra_bits > 0) {
+            decoder.br().refill();
+            value |= decoder.br().readBits(extra_bits);
           }
-        } else if (symbol >= 2) {
-          int extra_bits = symbol - 1;
-          value = 1 << extra_bits;
-          decoder.br().refill();
-          value |= decoder.br().readBits(extra_bits);
+          reps.rep[0] = value;
         }
         return value;
       });
@@ -1492,7 +1639,7 @@ private:
 
   template<bool is_offset>
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
-    if (kUseFSE) {
+    if (FLAG_use_fse) {
       FSEDecoder decoder(buf, end);
       return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int v = decoder.decodeOne();
@@ -1556,16 +1703,17 @@ void lzDecompress(uint8_t* buf, int64_t len, uint8_t* out, int64_t out_len) {
   }
 }
 
-std::unique_ptr<uint8_t> readEnwik8(int64_t& len) {
-  //FILE* f = fopen("enwik8", "r");
-  FILE* f = fopen("data/silesia.tar", "r");
+std::unique_ptr<uint8_t> readFile(const char* path, int64_t& len) {
+  FILE* f = fopen(path, "r");
+  CHECK(f != nullptr);
   fseek(f, 0, SEEK_END);
   len = ftell(f);
   fseek(f, 0, SEEK_SET);
 
   std::unique_ptr<uint8_t> buf;
   buf.reset(new uint8_t[len]);
-  fread(buf.get(), 1, len, f);
+  CHECK(fread(buf.get(), 1, len, f) == size_t(len));
+  fclose(f);
   return std::move(buf);
 }
 
@@ -1630,7 +1778,7 @@ bool testHuffman(uint8_t* buf, uint8_t* out, int64_t len) {
 
 void huffmanSpeed() {
   int64_t len;
-  std::unique_ptr<uint8_t> buf = readEnwik8(len);
+  std::unique_ptr<uint8_t> buf = readFile(FLAG_input_path, len);
   // len = 10000;
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
@@ -1656,7 +1804,7 @@ void huffmanSpeed() {
     printf("%.2lf seconds, %.2lf MB/s\n", elapsed, (len / (1024. * 1024.)) / elapsed);
   }
   {
-    std::unique_ptr<uint8_t> truth = readEnwik8(len);
+    std::unique_ptr<uint8_t> truth = readFile(FLAG_input_path, len);
     for (int i = 0; i < len; ++i) {
       CHECK(truth.get()[i] == buf.get()[i]);
     }
@@ -1668,8 +1816,8 @@ void tuneSettings() {
   uint8_t* buf;
   int64_t len;
 
-  std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
-  buf = enwik8.get();
+  std::unique_ptr<uint8_t> input = readFile(FLAG_input_path, len);
+  buf = input.get();
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);
@@ -1694,9 +1842,9 @@ void testLz() {
   uint8_t* buf;
   int64_t len;
 
-  std::unique_ptr<uint8_t> enwik8 = readEnwik8(len);
-  buf = enwik8.get();
-  len = 1000000;
+  std::unique_ptr<uint8_t> input = readFile(FLAG_input_path, len);
+  buf = input.get();
+  len = std::min<int64_t>(len, kLocalExperimentBytes);
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len+512]);
@@ -1785,7 +1933,7 @@ void testFSEEncoder() {
 
 void tests() {
   int64_t len;
-  std::unique_ptr<uint8_t> buf = readEnwik8(len);
+  std::unique_ptr<uint8_t> buf = readFile(FLAG_input_path, len);
   printf("Read %lld bytes\n", len);
   std::unique_ptr<uint8_t> out;
   out.reset(new uint8_t[len]);

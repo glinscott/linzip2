@@ -1,0 +1,1440 @@
+                **Modern LZ Compression**
+                Gary Linscott - glinscott@gmail.com - https://glinscott.github.io
+
+This article walks through the components of a modern LZ compressor.  It's
+amazing how rich and deep the compression field is.  If you enjoy algorithms
+and data structures, there are not too many better places to play.  I hope you
+enjoy reading it as much as I enjoyed writing it!
+
+By the end, we will have a compressor that can beat gzip while decompressing at
+almost the same speed -- in less than 1000 lines.  You can find the source for
+the article at https://github.com/glinscott/linzip2.
+
+Overview
+========
+
+LZ compression has been around for a long time, but there are still major
+improvements being made. The [deflate](https://en.wikipedia.org/wiki/DEFLATE)
+algorithm is perhaps the most widely used, implemented initially in
+[PKZIP](https://en.wikipedia.org/wiki/PKZIP), and these days finding broad
+usage in [gzip](https://en.wikipedia.org/wiki/Gzip).  Modern incarnations are
+much more powerful, and use a wide array of new tricks.  Two examples of the
+next generation are [zstd](https://github.com/facebook/zstd) and
+[lzma](https://en.wikipedia.org/wiki/Lempel%E2%80%93Ziv%E2%80%93Markov_chain_algorithm).
+For a comprehensive overview of open source LZ compressors, check out
+[lzbench](https://github.com/inikep/lzbench).
+
+The core of the algorithm is fairly simple. For each character, look backwards
+in the data stream to find matches. If there is a match, then encode the
+distance backwards, and the length of the match instead of the raw bytes
+themselves. If no match, encode the character itself as a literal. Note that
+choosing matches is not a trivial process, and is the reason why you pass
+different levels (amount of effort the compressor spends searching for the best
+matches) into most compressors.
+
+As an example, take the following string: ABABABABC
+
+1. Write out literal A, and literal B (nothing to match with)
+2. Write out a match pair of (-2, 2) — AB
+3. Write out a match pair of (-4, 4) — ABAB
+4. Write out literal C
+
+This is usually followed by using an entropy coder to represent the symbols
+using the minimum number of bits. There are two main types of entropy coders,
+Huffman and arithmetic. Huffman’s big advantage is speed, while arithmetic
+coding gives better compression. Deflate chose to use Huffman, and even today,
+it’s a good tradeoff in speed vs compression.
+
+But before we implement Huffman, we need to be able to read and write bits, not
+bytes.
+
+Reading and writing bits
+========================
+
+Reading bits
+------------
+
+Before we can do much with Huffman codes, we need an efficient way to read and
+write bits.  Fabien Giesen delves into efficiently reading bits in an
+incredible series
+[here](https://fgiesen.wordpress.com/2018/02/19/reading-bits-in-far-too-many-ways-part-1/).
+
+The approach we will use keeps a nice balance between simplicity and speed.
+We'll use a 32 bit buffer, which we will shift to the left as we consume the
+bits.  Then, to `refill` the buffer, we will `or` the current byte we are
+reading, shifted left into the correct position.
+
+Here is the code:
+~~~ c++
+class BitReader {
+public:
+  BitReader(uint8_t* buffer, uint8_t* end)
+    : current_(buffer),
+      end_(end) {
+    refill();
+  }
+
+  // Consume one bit.  Result is 0 or 1.
+  int readBit();
+
+  // Fill buffer with up to 32 bits.
+  void refill();
+
+private:
+  uint8_t* current_;
+  uint8_t* end_;
+  uint32_t bits_ = 0;
+  int position_ = 24;
+};
+~~~
+
+Reading a bit is simple, we extract the top bit from `bits_` and shift left by
+one, which moves the next bit into position.  Note that for speed, we don't
+refill automatically, so users of the API need to be careful to call `refill()`
+as needed.
+
+~~~ c++
+int BitReader::readBit() {
+  int r = bits_ >> 31;
+  bits_ <<= 1;
+  ++position_;
+  return r;
+}
+~~~
+
+Refill is also fairly straightforward.  We read the current byte in, and `or` it
+into `bits_`, shifted left by `position_`.  When `position_` goes below zero,
+we stop, knowing we have filled up `bits_`.  Then, when reading, `position_` is
+incremented, telling us how much we have used.
+
+One interesting special case that we handle for speed is the end of the buffer.
+We want the compiler to ideally use a `cmov`, so do a simple comparison with the
+end of the buffer.
+
+~~~ c++
+void BitReader::refill() {
+  while (position_ >= 0) {
+    bits_ |= (current_ < end_ ? *current_ : 0) << position_;
+    position_ -= 8;
+    ++current_;
+  }
+}
+~~~
+
+Writing bits
+------------
+
+Writing bits is a similar concept to reading, we will keep a 32-bit buffer, and
+when it is full, write out bytes to our destination.
+
+~~~ c++
+class BitWriter {
+public:
+  BitWriter(uint8_t* buffer)
+    : start_(buffer),
+      current_(buffer) {
+  }
+
+  // Write a single bit.
+  void writeBit(int v);
+
+  // Flush all bits, and return number of bytes written to buffer.
+  int64_t finish();
+
+private:
+  // Write accumulated bits to buffer.
+  void flush();
+
+  uint8_t* start_;
+  uint8_t* current_;
+  uint32_t bits_ = 0;
+  int position_ = 0;
+};
+~~~
+
+Writing a bit to the buffer is straightforward, we simply shift the buffer left
+by one, then or `v` in.
+
+~~~ c++
+void BitWriter::writeBit(int v) {
+  bits_ = (bits_ << 1) | v;
+  ++position_;
+  if (position_ >= 8) {
+    flush();
+  }
+}
+~~~
+
+Flushing is similar to `refill()` on the reading side, we write out the eight
+bits that were written earliest.
+
+~~~ c++
+void BitWriter::flush() {
+  while (position_ >= 8) {
+    position_ -= 8;
+    *current_ = (bits_ >> position_) & 0xFF;
+    ++current_;
+  }
+}
+~~~
+
+Now that we can read and write bits efficiently, let’s dig into the
+implementation of a modern Huffman implementation.
+
+Huffman coding
+==============
+
+The core idea behind any entropy coder is to encode frequently used symbols
+using fewer bits.  Huffman codes are in a class called prefix codes.  When
+reading a prefix code, after each bit, you can determine whether you need to
+keep reading another bit, or you are done. The
+[wikipedia](https://en.wikipedia.org/wiki/Huffman_coding) page covers the
+algorithm very well with some nice examples.
+
+The basic idea is to represent all the symbols in a binary tree, with distance
+from the root proportional to the probability. Below is an example, where we
+have four symbols.  Note that the length of the code is shorter the more
+frequently the symbol appears -- this gives us our savings.
+
+Symbol | Probability |Code
+-------|-------------|-----
+a1     | 0.4         | 0
+a2     | 0.35        | 10
+a3     | 0.2         | 110
+a4     | 0.05        | 111
+[Encoding for the symbols]
+
+********************
+*     0            *
+*   .--- a1        *
+*   |              *
+*---+     0        *
+*   |   .--- a2    *
+*   | 1 |          *
+*   '---+     0    *
+*       | 1 .--- a3*
+*       '---+ 1    *
+*           '--- a4*
+********************
+
+The symbols are encoded in the bitstream with their code.  An inefficient way
+of doing this is walking the tree from the symbol back up to the root, and for
+each edge you walk, you add that bit to the bitstream.  We will use a much more
+efficient technique.
+
+!!! Note Huffman in the Literature
+   One of the most useful (and certainly the most interesting) places to read
+   about compression on the net is Charles Bloom’s website. In particular he
+   covers state-of-the-art Huffman on his
+   [blog](http://cbloomrants.blogspot.com/2010/08/08-12-10-lost-huffman-paper.html).
+
+!!! Note Determining Probabilities
+   We can estimate these probabilities dynamically using a predictor, which
+   leads to approaches like [PAQ](http://mattmahoney.net/dc/), or by simply
+   scanning the entire range we want to compress and counting the values.
+   Scanning, and building a static probability table is the approach most LZ
+   encoders take because it's so fast.
+
+Building the tree
+-----------------
+
+Building the prefix codes is a multi-stage process.  Here is what it will look
+like to clients of the API.
+
+~~~ c++
+HuffmanEncoder encoder(out);
+// Scan frequencies
+for (int64_t i = 0; i < len; ++i) {
+  encoder.scan(buf[i]);
+}
+// Write out table
+encoder.buildTable();
+// Write out compressed symbols
+for (int64_t i = 0; i < len; ++i) {
+  encoder.encode(buf[i]);
+}
+~~~
+
+HuffmanEncoder will write the table out when `buildTable()` is called, then the
+symbols through `encode()`.  Our goal is for `encode()` to be as efficient as
+possible, we will do that by building the following arrays:
+
+~~~ c++
+uint8_t length_[256];
+int code_[256];
+~~~
+
+Then the implementation of `encode()` is simply:
+
+~~~ c++
+void HuffmanEncoder::encode(int symbol) {
+  writer_.writeBits(code_[symbol], length_[symbol]);
+}
+~~~
+
+### Structure of the tree
+
+To build that efficient table requires constructing the Huffman tree, let's dig
+into that.  We will use a simple `struct` for the tree nodes, and then an array
+to hold the tree in, as well as all the symbols.  We'll limit ourselves to a
+maximum of 256 symbols, so we need up to 512 total nodes for our tree.
+
+!!! Note Number of Symbols
+   For our LZ encoder, most Huffman codes will have a maximum of 32 symbols, so
+   it's important that we handle those cases efficiently.  However, for storing
+   the literals, we will need up to 256 symbols, so that's why the arrays are a
+   fixed large size.
+
+~~~ c++
+struct Node {
+  int freq;
+  int symbol;
+  Node* l;
+  Node* r;
+};
+
+// For sorting on frequency.
+struct Comparator {
+  bool operator()(const Node* l, const Node* r) {
+    return l->freq > r->freq;
+  }
+};
+
+Node nodes_[512];
+~~~
+
+Now, `scan()` is simply:
+
+~~~ c++
+void HuffmanEncoder::scan(int symbol) {
+  ++nodes_[symbol].freq;
+}
+~~~
+
+### HuffmanEncoder::buildTable()
+
+`buildTable()` does the majority of the work.  Let's break it down into a few
+phases:
+
+~~~ c++
+void HuffmanEncoder::buildTable() {
+  // Coalesce used symbols, and add to heap
+  Node* q[256];
+  int num_symbols = 0;
+  for (int i = 0; i < max_symbols_; ++i) {
+    if (nodes_[i].freq) {
+      nodes_[num_symbols] = nodes_[i];
+      q[num_symbols] = &nodes_[num_symbols];
+      ++num_symbols;
+    }
+  }
+  ...
+~~~
+
+The first section, we count the number of symbols actually present, and compact
+the `nodes_` array just to active symbols (this makes everything easier later).
+While counting, we also add them into our `Node *q[256]`, which we will turn
+into a heap for efficiently building the tree.
+
+### Priority Queue tree building
+
+~~~ c++
+void HuffmanEncoder::buildTable() {
+  ...
+  Comparator c;
+  std::make_heap(&q[0], &q[num_symbols], c);
+
+  // Build Huffman tree
+  for (int i = num_symbols; i > 1; --i) {
+    Node* n1 = q[0];
+    std::pop_heap(&q[0], &q[i], c);
+    Node* n2 = q[0];
+    std::pop_heap(&q[0], &q[i-1], c);
+
+    Node* parent = &nodes_[num_symbols+i];
+    parent->freq = n1->freq + n2->freq;
+    parent->symbol = -1;
+    parent->l = n2;
+    parent->r = n1;
+    q[i-2] = parent;
+    std::push_heap(&q[0], &q[i-1], c);
+  }
+  ...
+~~~
+
+This step requires a bit of explanation.  We build a heap using
+`std::make_heap`, and our custom `Comparator`, then, using the heap property,
+we extract the two lowest values from the heap.  We then construct a parent
+node, with the two lowest values as children, and add the parent into the heap
+with a frequency of the sum of their children.  This gives us $\O(nlogn)$
+complexity for building the tree.  Since we pop two elements, and push one each
+iteration, we know that it will take us exactly `num_symbols - 1` iterations.
+
+!!! Note std::priority_queue vs std::make_heap
+   There is a prority_queue class in the C++ std library, but it defaults to
+   using a `std::vector` for storage, and we'd like to avoid any heap
+   allocations.  I benchmarked the `std::make_heap` approach as just slightly faster.
+
+At the end of this loop, we've got one node sitting in `q[0]` -- the root of the tree.
+
+### Mark leaf depth
+~~~ c++
+void HuffmanEncoder::buildTable() {
+  ...
+  // Label the distances from the root for the leafs
+  walk(q[0], num_symbols == 1 ? 1 : 0);
+  ...
+~~~
+
+The implementation of `walk()` is a simple traversal of the tree, marking each
+leaf node with the depth from the root.
+
+~~~ c++
+void HuffmanEncoder::walk(Node* n, int level) {
+  if (n->symbol != -1) {
+    // NOTE: re-using freq here to mean distance from root.
+    n->freq = level;
+    return;
+  }
+
+  walk(n->l, level + 1);
+  walk(n->r, level + 1);
+}
+~~~
+
+Using the distances from the root (which are equivalent to the code length), we
+now can build our table.
+
+~~~ c++
+void HuffmanEncoder::buildTable() {
+  ...
+  // Sort leaf nodes into level order.  This is required
+  // for both length limiting and writing the table.
+  std::sort(&nodes_[0], &nodes_[num_symbols],
+            [](const Node& l, const Node& r){return l.freq < r.freq;});
+
+  // NOTE: disabled for this initial stage
+  // limitLength(num_symbols);
+
+  writeTable(num_symbols);
+  buildCodes(num_symbols);
+}
+~~~
+
+### HuffmanEncoder::writeTable()
+
+`writeTable()` writes the structure of the Huffman table out to the bitstream.
+We will use a very simple representation, write the number of symbols, then for
+each symbol, the actual symbol, and the code length.
+
+!!! NOTE Writing the Huffman Table
+   There are a *lot* of potential optimizations here, but to keep things
+   relatively simple, we won't use most of them.  Charles Bloom has an
+   [excellent
+   discussion](http://cbloomrants.blogspot.com/2010/08/08-10-10-transmission-of-huffman-trees.html)
+   on some potential approaches.
+
+   Of note,
+   [ZStd](https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#finite-state-entropy-fse-compression-of-huffman-weights)
+   use FSE compression to store the weights themselves, and multiple different
+   ways of storing the tree.
+
+
+~~~ c++
+void writeTable(int num_symbols) {
+  const int kSymBits = log2(max_symbols_);
+  writer_.writeBits(num_symbols, kSymBits);
+
+  for (int i = 0; i < num_symbols; ++i) {
+    writer_.writeBits(symbol, kSymBits);
+    writer_.writeBits(level - 1, 4);
+  }
+
+  // Byte align after the table
+  writer_.finish();
+}
+~~~
+
+### HuffmanEncoder::buildCodes()
+
+Finally, we will build our `length_` and `code_` arrays to allow us to
+efficiently write out the binary representation of the symbols.  Since we've
+sorted our array by increasing distance from the root, we can do this in an
+efficient $\O(n)$ pass through the symbols.
+
+The key insight is that we can simply increment the `code` while we remain at
+the same length!  Then, when we move to a new length, we can shift left by the
+difference in lengths.  This works exactly because we are using a prefix code,
+any values that we've already used can't be used as the prefix of a longer
+code.  Let's look at the code, then an example.
+
+!!! NOTE LOGV
+   The LOGV construct is a handy way of doing verbose logging based on a numeric
+   level.  Eg. V=0 is no logging, V=1 is minimal, V=2 is more verbose, etc.  I
+   got the idea from [glog](https://github.com/google/glog), but used a super
+   minimal implementation here.
+
+~~~ c++
+void buildCodes(int num_symbols) {
+  int code = 0;
+  int last_level = -1;
+  for (int i = 0; i < num_symbols; ++i) {
+    // Build the binary representation.
+    int level = nodes_[i].freq;
+    if (last_level != level) {
+      if (last_level != -1) {
+        ++code;
+        code <<= (level - last_level);
+      }
+      last_level = level;
+    } else {
+      ++code;
+    }
+
+    int symbol = nodes_[i].symbol;
+    length_[symbol] = level;
+    code_[symbol] = code;
+
+    LOGV(2, "code:%s hex:%x level:%d symbol:%d\n",
+         toBinary(code, level).c_str(), code, level, symbol);
+  }
+}
+~~~
+
+An example helps illustrate the principle of building the code.  Let's use a string
+that matches our earlier example: "AAAAAAAABBBBBBBCCCCD".  The "Calculation" column
+represents the operations we did to get the code for that symbol.
+
+Symbol | Code | Level | Calculation
+-------|------|-------|-------
+A      | 0    | 1     | `last_level = 1;`
+B      | 10   | 2     | `last_level = 2; ++code; code <<= (2 - 1);`
+C      | 110  | 3     | `last_level = 3; ++code; code <<= (3 - 2);`
+D      | 111  | 3     | `++code;`
+
+### Summary
+
+The implementation of Huffman we have built gives the following results on the
+standard [enwik8](http://mattmahoney.net/dc/textdata.html) dataset (100
+megabytes of wikipedia text):
+~~~ none
+Encoded 100000000 into 63862034 bytes
+0.51 seconds, 187.29 MB/s
+~~~
+
+Not a bad start, we’ve gone from 100MB down to 63.8MB.  We can’t decompress
+efficiently yet, as our approach to decompression assumes a maximum length of
+11 bits for the code. That will be remedied soon!
+
+Length-limited Huffman coding
+-----------------------------
+
+For efficiency on the decoder side, we want to restrict the maximum length of a
+single code. Traditional Huffman could use a large number of bits for symbols
+that are very infrequent (worst case, the length could be up to the number of
+symbols you have in your alphabet).  Limiting the length allows us to use a
+table driven approach without any branches to decode a symbol, while using a
+minimal amount of memory, so our table lives in L1/L2 cache.
+
+The canonical paper in this area is
+[here](https://www.ics.uci.edu/~dan/pubs/LenLimHuff.pdf), described well in the
+[wiki](https://en.wikipedia.org/wiki/Package-merge_algorithm).  This approach
+is overkill for our purposes though.
+
+Charles Bloom’s
+[blog](http://cbloomrants.blogspot.com/2010/07/07-03-10-length-limitted-huffman-codes.html)
+describes a simple two-pass approach which we will use, based on the
+[Kraft-McMillan
+inequality](https://en.wikipedia.org/wiki/Kraft%E2%80%93McMillan_inequality).
+There are some interesting gotchas while implementing this, the equations are
+all in floating point, but it’s both more efficient, and more correct to do it
+by treating the integer as a fraction
+
+!!! NOTE Integer vs Floating point
+   Using integers to represent fractions for exact arithmetic has an
+   interesting parallel to Michael Abrash's [Graphics Programming Black
+   Book](http://www.jagregory.com/abrash-black-book/), where he talks about
+   integer approaches for [drawing
+   polygons](http://www.jagregory.com/abrash-black-book/#fast-edge-tracing)
+   being superior to floating-point.  Most of the techniques are not directly
+   relevant any more, but the writing is amazing, and the problem solving
+   process is still totally relevant. If you haven't read it yet, I highly
+   recommend it!
+
+The code itself is fairly short, but packs in a good amount of complexity to
+make up for the terseness.
+
+~~~ c++
+void HuffmanEncoder::limitLength(int num_symbols) {
+  // Limit the maximum code length
+  int k = 0;
+  int maxk = (1 << kMaxHuffCodeLength) - 1;
+  for (int i = num_symbols - 1; i >= 0; --i) {
+    nodes_[i].freq = std::min(nodes_[i].freq, kMaxHuffCodeLength);
+    k += 1 << (kMaxHuffCodeLength - nodes_[i].freq);
+  } 
+  ...
+~~~
+
+First, we just shorten any symbols that are longer than our maximum code length
+-- 11 -- to that value.  This means that our tree will no longer be a Huffman
+tree, so we need to do a fixup pass to redistribute the error we've introduced.
+
+~~~ c++
+  ...
+  for (int i = num_symbols - 1; i >= 0 && k > maxk; --i) {
+    while (nodes_[i].freq < kMaxHuffCodeLength) {
+      ++nodes_[i].freq;
+      k -= 1 << (kMaxHuffCodeLength - nodes_[i].freq);
+    } 
+  }
+  ...
+~~~
+
+In the first fixup pass, we go from the largest symbols to the smallest.  While
+there is still some error `k` to redistribute, we increase the length of the
+code.  At the end of this loop, `k < maxk`.  We want the error to be as small
+as possible though, otherwise we are wasting bits, so we do a final pass.
+
+~~~ c++
+  ...
+  for (int i = 0; i < num_symbols; ++i) {
+    while (k + (1 << (kMaxHuffCodeLength - nodes_[i].freq)) <= maxk) {
+      k += 1 << (kMaxHuffCodeLength - nodes_[i].freq);
+      --nodes_[i].freq;
+    } 
+  } 
+} 
+~~~
+
+The final pass starts from smallest symbols up, checking if we have enough room
+in the error term to decrease the length of that symbol.
+
+After modifying our basic Huffman above to be length-limited to a maximum of 11
+bits, we get the following numbers:
+~~~ None
+Encoded 100000000 into 65503537 bytes
+0.51 seconds, 187.35 MB/s
+num_sym 205 codelen(min:3, max:11)
+~~~
+
+So, we’ve lost a little optimality on the 100mb enwik8 (65.5MB vs 63.6MB) — but
+thankfully we will not be encoding anything near this large, we will break up
+our data into smaller chunks so we can keep it all in a small amount of RAM.
+
+Chunking
+--------
+
+There are multiple benefits to chunking our data. We keep our RAM overhead
+smaller, and it allows the compression to adapt to changes in the data. Here is
+our data when using chunks of 256KB:
+~~~ None
+Encoded 100000000 into 64916927 bytes
+0.52 seconds, 182.33 MB/s
+~~~
+
+Notice it’s actually smaller than using a single Huffman table across the
+entire file — even though we’ve had to write out a separate table for each
+chunk!  The additional overhead from writing the tables is only 105KB.
+
+This is a useful point to compare against an industrial strength compressor
+like gzip. We won’t start comparing ourselves to zstd yet :).
+
+~~~ None
+gzip enwik8 100000000 into 36548940 bytes
+4.82s compression
+0.46s decompression
+~~~
+
+We are almost 2x the size of gzip!  That shows the power of good LZ compression
+on a text dataset.  The only advantage of pure Huffman is that it compresses
+faster.
+
+Decompression
+-------------
+
+First, we need to read back in our tree description.  It's a simple inverse of
+writing the tree out.
+
+~~~ c++
+void HuffmanDecoder::readTable() {
+  br_.refill();
+  num_symbols_ = br_.readBits(sym_bits_);
+
+  CHECK(num_symbols_ <= kMaxSymbols);
+
+  for (int i = 0; i < num_symbols_; ++i) {
+    br_.refill();
+    int symbol = br_.readBits(sym_bits_);
+    int codelen = br_.readBits(4) + 1;
+    LOGV(2, "sym:%d len:%d\n", symbol, codelen);
+
+    ++codelen_count_[codelen];
+    symbol_length_[i] = codelen;
+    symbol_[i] = symbol;
+    min_codelen_ = std::min(min_codelen_, codelen);
+    max_codelen_ = std::max(max_codelen_, codelen);
+  }
+  LOGV(1, "num_sym %d codelen(min:%d, max:%d)\n",
+       num_symbols_, min_codelen_, max_codelen_);
+
+  // Ensure we catch up to be byte aligned.
+  br_.byteAlign();
+}
+~~~
+
+The core of the decompression is our table-driven decoder.  This is why we
+limited our encoder to a maximum of 11 bits.  The table-driven decoder is
+structured around the idea that we can look at a fixed number of bits, and
+determine exactly what symbol to decode, and how many bits it used with a
+single table lookup.
+
+~~~ c++
+uint8_t HuffmanDecoder::decodeOne() {
+  br_.refill();
+  int n = br_.bits() >> (32 - max_codelen_);
+  int len = bits_to_len_[n];
+  br_.readBits(len);
+  return bits_to_sym_[n];
+}
+~~~
+
+The core are the `bits_to_len_` and `bits_to_sym_` arrays.  Building those is
+a little tricky.
+
+~~~ c++
+void HuffmanDecoder::assignCodes() {
+  int p = 0;
+  uint8_t* cursym = &symbol_[0];
+  for (int i = min_codelen_; i <= max_codelen_; ++i) {
+    int n = codelen_count_[i];
+    if (n) {
+      int shift = max_codelen_ - i;
+      memset(bits_to_len_ + p, i, n << shift);
+      int m = 1 << shift;
+      do {
+        memset(bits_to_sym_ + p, *cursym++, m);
+        p += m;
+      } while(--n);
+    }
+  }
+}
+~~~
+
+Now, we can decode our compressed Huffman data!  The speed is pretty good as well,
+although there are multiple ways of speeding it up.
+
+!!! NOTE Super-fast Huffman
+   One of the modern tricks is utilizing SSE for decoding 4 bytes at a time in
+   the decode loop.  This adds significant complexity (you have to write 4
+   streams out instead of one, and SSE is always tricky), but leads to a large
+   increase in decode speed.
+
+   As usual, Charles Bloom has a great post on [Huffman
+   performance](http://cbloomrants.blogspot.com/2015/10/huffman-performance.html)
+   as well.
+
+LZ Coding
+=========
+
+With the fundamentals of reading/writing bits and Huffman coding established,
+we are finally ready to start actually building our actual LZ compressor.
+
+A sneak peak of the results for our initial version:
+~~~ none
+Ours: 100000000 -> 36691606 (36.6%)
+3.84 seconds, 24.82 MB/s
+0.54 seconds, 177.56 MB/s
+
+gzip: 100000000 -> 36548940 (36.5%)
+4.82s compression
+0.46s decompression
+~~~
+
+This is almost the same compression rate as gzip, compresses a little faster,
+and decompresses a little slower.  However, there are plenty of speed and
+compression rate improvements to make -- those will come later, the initial
+version is meant to be as simple as possible while still achieving good
+results.
+
+As a comparison, zstd on it's best compression level, 19, gets down to 27.1%!
+It takes about a minute at that level though.  On level 9, it gets 31.8% in
+only five seconds.
+
+Structure
+---------
+
+The structure most-modern LZ encoders use is to write a sequence of commands,
+structured as `(literal count, match length, match offset)`. This allows us to
+avoid any special flags to determine if we are decoding a literal or a match.
+It's not a hard rule though.  Super-fast compressors like lz4, which don't use
+Huffman for the matches, make a different choice for speed.
+
+For our goal of a high compression LZ variant, we will want to Huffman code our
+symbols (zstd actually uses FSE, a variant of arithmetic coding to do this, but
+we will cover that in a future post).
+
+Let's work through what "ABABABABC" would look like.  I've instrumented the
+compressor to show literals as the direct character, and matches enclosed in
+(()). Here is what we get:
+
+~~~ None
+ABABABABC -> AB((ABABAB))C
+
+Encoded as:
+(literal_count:2, match_length:6, match_offset:-2)
+(literal_count:1, match_length:0, match_offset:0)
+~~~
+
+This is interesting -- we got a match longer than the history! In a bit of
+algorithmic magic, LZ encoders can represent runs of the same pattern using a
+match. This is like getting a more advanced run-length encoder for free! It
+simply encodes a match past the length of the pattern. Let's run the decoder
+for the above to see how it works:
+
+1. Literal count of 2, decode "AB"
+2. Match length 6, offset -2.  We need to copy 6 characters, but we've only got
+   2 in our buffer right now.  Our cursor "|" starts 2 bytes back from our
+   current position, "|AB".  We copy those two, then our buffer will be "ABAB",
+   and our copy cursor will be sitting at position 2 now "AB|AB".  So, we can
+   keep going, because our buffer was filled before we got there.  Easy, once
+   you see the trick.
+3. Literal count of 1, decode "C"
+
+Matches
+-------
+
+### Match Representation
+
+Representing the symbols is pretty easy, they are just the byte value.
+Representing the matches is actually a little tricky though. If we allow large
+match lengths and offsets, they can take up a lot of bits, which means our
+Huffman table gets prohibitively large. Older compression schemes like gzip
+dodged this by limiting the offset to 32k. Modern schemes employ a very smart
+trick here.
+
+We will split the value into two parts. First, we pick some logarithmic
+function, and use that as our symbol to Huffman code. A simple example is just
+$2^i$. So a match length of 4 would be encoded as i=2, and match of 256 would
+be i=8. What about a non-power of two though? Here comes the magic - we encode
+the distance from the base using the minimal number of bits (eg. for a value of
+4, we know the maximum offset can be 3 before we hit 8, and it would be a new
+exponent), and directly write those to our output bitstream. This allows us to
+represent almost arbitrarily large matches/offsets, while bucketing things
+enough for Huffman to compress really well.  This also is the reason why we only
+need 32 symbols for most of our Huffman tables, $2^{32}$ allows us to represent
+offsets and lengths of up to 4 billion!
+
+Let's work through a few examples:
+
+Value | Base     | Symbol  | Distance
+------|----------|---------|--------
+4     | $2^2=4$  | 2       | 0
+5     | $2^2=4$  | 2       | 1
+32    | $2^5=32$ | 5       | 0
+63    | $2^5=32$ | 5       | 31
+
+There is an easy win here though.  Small lengths are much more common than
+large ones, and so we will only start using our $2^i$ encoding when the value
+is greater than 15.  Offsets are usually quite large, so we won't use this
+special case.  It's almost a 1% compression win vs just straight log2:
+~~~ none
+before: 37003504
+after:  36691606
+~~~
+
+Here is the code for encoding values:
+~~~ c++
+int lengthCode(int length) {
+  if (length <= 15) {
+    return length;
+  }
+  return 12 + log2(length);
+}
+
+int lengthExtra(int length) {
+  return length - (1 << log2(length));
+}
+
+int offsetCode(int offset) {
+  if (offset < 2) {
+    return offset;
+  }
+  return 1 + log2(offset);
+}
+
+int offsetExtra(int offset) {
+  return offset - (1 << log2(offset));
+}
+~~~
+
+We need an efficient integer log2, thankfully there are intrinsics that make this
+super fast on modern CPUs:
+~~~ c++
+int log2(int v) {
+  if (v > 0) {
+    return 31 - __builtin_clz(v);
+  } else {
+    return 0;
+  }
+}
+~~~
+
+Then, to actually write out the values, we Huffman the length and offset codes,
+and then write out the offset bits directly into the bitstream, as mentioned
+above.
+~~~ c++
+template< bool is_offset >
+int64_t LzEncoder::writeValues(uint8_t* out, const int* values) {
+  HuffmanEncoder encoder(out, 32);
+  for (int i = 0; i < num_seq_; ++i) {
+    encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
+  }
+  encoder.buildTable();
+  for (int i = 0; i < num_seq_; ++i) {
+    int v = values[i];
+    encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
+    LOGV(3, "Encoding %d -> %d (%d, %d)\n",
+         v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
+         is_offset ? offsetExtra(v) : lengthExtra(v));
+    if (v >= (is_offset ? 2 : 16)) {
+      int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
+      encoder.writer().writeBits(extra, log2(v));
+    }
+  }
+  return encoder.finish();
+}
+~~~
+
+### Finding Matches
+
+A key part of an LZ compressor is finding the possible matches from a given
+position.  For example, given "ABCABABC", if we are here "ABCAB|ABC", we have
+two different matches possible, offset -5 and offset -2.  At offset -5, we
+could match 1, 2, or 3 bytes.  At offset -2, we could match 1 or 2 bytes.
+
+The first approach we will implement is a classic known as Hash-Chain.  We
+will keep a hash-table that is the size of our "window".  The "window" is how
+far we allow the compressor to look backwards to find matches.  The larger it
+is the more opportunity for finding matches, but the more work the compressor
+needs to do.
+
+!!! NOTE More from Charles Bloom
+   Charles Bloom has an in-depth exploration of possible matching algorithms
+   and their different tradeoffs.  Here are some of the posts you can use as
+   good jumping off points:
+   - [Match Finding Redux](http://cbloomrants.blogspot.com/2015/03/03-04-15-lz-match-finding-redux.html)
+   - [String Matcher Decision Tree](http://cbloomrants.blogspot.com/2012/09/09-24-12-lz-string-matcher-decision-tree.html)
+   - [More on LZ String Matching](http://cbloomrants.blogspot.com/2011/09/09-25-11-more-on-lz-string-matching.html)
+   - [String Match Results Part 5](http://cbloomrants.blogspot.com/2011/09/09-30-11-string-match-results-part-5.html)
+
+Hash-Chain builds a linked-list for equivalent matches.  It does so in a very
+efficient way, with no memory allocation required, and very low overhead per
+node.  It uses the hash value as the lookup into the linked list.  The hash
+value is just the first three bytes of the match.
+
+To build those linked lists, we will keep two arrays `ht_`, which has pointers
+to the head of the list for a given hash value, and `chain_`, which contains
+the index of the next element in the linked list.  The really nice property of
+this is that we don't need to delete older offsets from the `chain_` list, we
+can just filter them out as we hit them.
+
+Here is the structure of the MatchFinder class:
+~~~ c++
+class MatchFinder {
+public:
+  MatchFinder(int64_t window_size)
+    : window_size_(window_size),
+      window_mask_(window_size - 1) {
+    ht_.resize(window_size, -window_size);
+    chain_.resize(window_size, -window_size);
+  }
+
+  // Insert `pos` into the hash chain, and check for best match.
+  // Returns length of best match found.  match_pos contains offset of best match.
+  int findMatch(uint8_t* buf, uint8_t* buf_end, int64_t pos, int64_t& match_pos);
+
+  // Insert `pos` into the hash chain without checking for matches.
+  void insert(uint8_t* buf, int64_t pos);
+
+private:
+  int64_t window_size_;
+  int64_t window_mask_;
+  std::vector<int> ht_;
+  std::vector<int> chain_;
+};
+~~~
+
+Let's look at `insert` first, as it illustrates the process nicely:
+~~~ c++
+void MatchFinder::insert(uint8_t* buf, int64_t pos) {
+  // Take hash of first three bytes.
+  int key = hash32(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16));
+  key &= window_mask_;
+  // ht_[key] is the first element in the linked list, add it to the chain.
+  chain_[pos & window_mask_] = ht_[key];
+  // And now, insert `pos` as the first element in the list.
+  ht_[key] = pos;
+}
+~~~
+
+In `findMatch`, we walk the list we have built, and for efficiency, we also
+insert `pos` into the list as well (same code as `insert`, just inlined).  One
+key thing we are doing here is only checking the most recent 16 matches.  This
+is not optimal, but otherwise you can get $O(n^2)$ behavior (imagine a file of
+all AAAAA, the linked list for the AAA hash will have one entry for every
+position in the file).  This is something to revisit later when dealing with
+optimal parses.  Also, the reason we initialized our offsets to `-window_size_`
+now becomes clear -- we don't need a special case for before the start of
+input.
+~~~ c++
+int MatchFinder::findMatch(uint8_t* buf, uint8_t* buf_end,
+                           int64_t pos, int64_t& match_pos) {
+  int best_match_len = 0;
+
+  int key = hash32(buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16));
+  key &= window_mask_;
+  int64_t next = ht_[key];
+
+  // Only look back `window_size_` bytes.
+  int64_t min_pos = pos - window_size_;
+  int hits = 0;
+  // Limit the number of hash buckets we search, otherwise the search can blow up
+  // for larger window sizes.
+  const int kNumHits = 16;
+  while (next > min_pos && ++hits < kNumHits) {
+    int match_len = matchLength(&buf[pos], &buf[next], buf_end);
+    if (match_len > best_match_len) {
+      best_match_len = match_len;
+      match_pos = next;
+    }
+
+    // Walk to next element in list.
+    next = chain_[next & window_mask_];
+  }
+
+  // Insert new match
+  chain_[pos & window_mask_] = ht_[key];
+  ht_[key] = pos;
+
+  return best_match_len;
+}
+~~~
+
+One missing function is `matchLength`, it's very straightforward, just
+comparing that the bytes match.  A tiny optimization is to compare the first 4
+bytes as a 32 bit value.  Modern processors can do that just as quickly as
+comparing each byte.
+~~~ c++
+int matchLength(uint8_t* src, uint8_t* match, uint8_t* end) {
+  // Do a fast match against the first 4 bytes.  Note that this
+  // excludes matches with length less than 4, but matches that
+  // small are not a good use of bits.
+  uint32_t* s32 = reinterpret_cast<uint32_t*>(src);
+  uint32_t* m32 = reinterpret_cast<uint32_t*>(match);
+  if (*s32 != *m32) {
+    return 0;
+  }
+
+  int len = 4;
+  while (src + len < end && src[len] == match[len]) {
+    ++len;
+  }
+  return len;
+}
+~~~
+
+## Parsing
+
+This is where compressors differentiate themselves.  The naive approach is to
+pick the longest match possible at any position.  This worked well for older LZ
+schemes, but modern approaches (like ours) Huffman code the match lengths and
+offsets.  When we do this, the optimization problem is harder -- we want to
+minimize the size of the code stream after Huffman compression, so picking a
+shorter match might be better because it's a more common value, leading to a
+lower size file!  This makes finding the optimal match a much harder problem.
+
+For now, we will just pick the longest match that we find within our window.
+Definitely not optimal, but it gets us started!
+
+~~~ c++
+void LzEncoder::fastParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+  const int kMinMatchLen = 5;
+  int num_literals = 0;
+
+  for (int64_t i = p; i < p_end; ++i) {
+    // Output a match?  Or a literal?
+    int64_t match_pos;
+    int match_len = matcher_.findMatch(buffer, buffer + p_end, i, match_pos);
+    if (match_len >= kMinMatchLen && i < p_end - 4) {
+      match_offsets_[num_seq_] = i - match_pos;
+      match_lengths_[num_seq_] = match_len;
+      literal_lengths_[num_seq_] = num_literals;
+      ++num_seq_;
+      num_literals = 0;
+
+      while (--match_len > 0) {
+        matcher_.insert(buffer, ++i);
+      }
+    } else {
+      literals_[num_lit_++] = buffer[i];
+      ++num_literals;
+    }
+  }
+  if (num_literals != 0) {
+    literal_lengths_[num_seq_] = num_literals;
+    match_offsets_[num_seq_] = 0;
+    match_lengths_[num_seq_] = 0;
+    ++num_seq_;
+  }
+}
+~~~
+Here is the fast method of building the sequences.  For each byte in the input,
+we check if we have a match.  If there is one, we use it, otherwise we add a
+literal to our buffer.  That's it!  One important part is making sure we insert
+the match substrings into the Hash-Chain, otherwise we lose a lot of potential
+matching opportunities.
+
+A tiny optimization is restricing the minimum length of a match to 5.
+
+## Optimal Parsing
+
+We will do a minimal implementation of an optimal parse, based on a description
+from [Bulat Ziganshin](https://encode.ru/threads/1895-LZ-Optimal-parsing).
+
+1. Walk forward, and for each byte, compute the cost to encode a literal, or
+   one of the possible matches, and write it into the cost array.
+2. Walk backward, picking the best option at each step.
+
+Computing the cost of encoding a literal is not easy - we need to know how many
+bits each symbol is going to be after Huffman coding.  Unfortunately, that is
+affected by all the other choices we make.  There are a variety of approaches
+to try and deal with this, even going as far as encoding each block multiple
+times, and using the statistics from the previous try to pick the costs for the
+current iteration.  For now, we will take the easiest approach, and pick a
+reasonable distribution for our costs.
+
+This relatively simple algorithm provides a big compression win, from 36.6% to
+34.5%.  It is substantially slower to compress, but there is plenty of room for
+optimization in a more complex implementation.
+~~~ none
+Optimal: 100000000 -> 34566497 (34.5%)
+17.26 seconds, 5.52 MB/s
+0.56 seconds, 171.80 MB/s
+~~~
+
+!!! NOTE LZ Optimal Parsing
+   Charles Bloom has a great series of posts where he talks about LZ Parsing
+   in depth.  I've ordered them from newest to oldest:
+
+   - [Two-step Parse](http://cbloomrants.blogspot.com/2016/06/06-09-16-fundamentals-of-modern-lz-two.html)
+   - [LZA New Optimal Parse](http://cbloomrants.blogspot.com/2015/01/01-23-15-lza-new-optimal-parse.html)
+   - [LZ Optimal Parse with A*](http://cbloomrants.blogspot.com/2011/10/10-24-11-lz-optimal-parse-with-star.html)
+   - [On LZ Optimal Parsing](http://cbloomrants.blogspot.com/2008/10/10-10-08-7_10.html)
+
+~~~ c++
+void LzEncoder::optimalParse(uint8_t* buffer, int64_t p, int64_t p_end) {
+  int64_t length = p_end - p;
+  std::vector<int> price(length + 1, 999999999);
+  std::vector<int> len(length + 1, 0);
+  std::vector<int> dist(length + 1, 0);
+
+  price[0] = 0;
+  ...
+~~~
+First, we set up the buffers we need - `price` holds the cost of encoding up to
+the given offset.  `len` and `dist` hold the sequence that got us there.
+
+~~~ c++
+  ...
+  // Forward pass, calculate best price for literal or match at each position.
+  for (int64_t i = 0; i < length; ++i) {
+    int lit_cost = price[i] + literal_price(buffer[i]);
+    if (lit_cost < price[i + 1]) {
+      price[i + 1] = lit_cost;
+      len[i + 1] = 1;
+      dist[i + 1] = 0;
+    }
+
+    // Don't try matches close to end of buffer.
+    if (i + 4 >= length) {
+      continue;
+    }
+
+    int64_t match_dist[16], match_len[16];
+    int matches = matcher_.findMatches(buffer, buffer + p_end, p + i, match_dist, match_len);
+    for (int j = 0; j < matches; ++j) {
+      int match_cost = price[i] + match_price(match_len[j], match_dist[j]);
+      if (match_cost < price[i+ match_len[j]]) {
+        price[i + match_len[j]] = match_cost;
+        len[i + match_len[j]] = match_len[j];
+        dist[i + match_len[j]] = match_dist[j];
+      }
+    }
+  }
+  ...
+~~~
+Then, we compute the cost for encoding a literal, or one of the best matches
+that we found.  If that cost is better than the previous cost for reaching the
+given byte, we use the new one.
+
+For our costs, we will use some simple heuristics, that came from me dumping
+the statistics over some example files.  `dist_cost` looks a little strange, it
+should really be `log2(dist) * 2`, however, I found the given version performs
+significantly better.  A minor mystery.
+~~~ c++
+int literal_price(int c) {
+  return 6;
+}
+
+int match_price(int len, int dist) {
+  int len_cost = 6 + log2(len);
+  int dist_cost = std::max(0, log2(dist) - 3);
+  return len_cost + dist_cost;
+}
+~~~
+
+Now, we do the backward pass, building up the sequences.  If we see `len[i] >
+1`, we know it was a match, otherwise it's a literal.
+~~~ c++
+ ...
+  // Backward pass, pick best option at each step.
+  if (len[length] <= 1) {
+    match_offsets_[num_seq_] = 0;
+    match_lengths_[num_seq_] = 0;
+    literal_lengths_[num_seq_] = 0;
+    ++num_seq_;
+  }
+  for (int64_t i = length; i > 0;) {
+    if (len[i] > 1) {
+      match_offsets_[num_seq_] = dist[i];
+      match_lengths_[num_seq_] = len[i];
+      literal_lengths_[num_seq_] = 0;
+      ++num_seq_;
+      i -= len[i];
+    } else {
+      literals_[num_lit_++] = buffer[p + i - 1];
+      ++literal_lengths_[num_seq_ - 1];
+      --i;
+    }
+  }
+  ...
+~~~
+
+And a final step, since we wrote the arrays in reverse order:
+~~~
+  ...
+  // We wrote the arrays in reverse, flip them for uniformity.
+  std::reverse(&literal_lengths_[0], &literal_lengths_[num_seq_]);
+  std::reverse(&match_offsets_[0], &match_offsets_[num_seq_]);
+  std::reverse(&match_lengths_[0], &match_lengths_[num_seq_]);
+  std::reverse(&literals_[0], &literals_[num_lit_]);
+}
+~~~
+
+## Writing LZ Blocks
+
+Let's walk through the structure of the main compression loop:
+~~~ c++
+// Compresses `buffer` from `buffer+p` to `buffer+p_end`.
+// Writes compressed sequence to `out`.
+// Returns number of bytes written to `out`.
+int64_t LzEncoder::encode(uint8_t* buffer, int64_t p, int64_t p_end, uint8_t* out) {
+  uint8_t* out_start = out;
+
+  num_seq_ = 0;
+  num_lit_ = 0;
+
+  if (level_ == 0) {
+    fastParse(buffer, p, p_end);
+  } else if (level_ == 1) {
+    optimalParse(buffer, p, p_end);
+  }
+  ...
+~~~
+Here, we execute either a `fastParse` or `optimalParse`, depending on the level
+requested by the user.
+
+Next up, we write out our Huffman compressed literals:
+~~~ c++
+  ...
+  // Write literal section
+  {
+    // Uncompressed length
+    writeInt<3>(out, num_lit_);
+    out += 3;
+    // Compressed length
+    uint8_t* marker = out;
+    out += 3;
+
+    // Huffman table for literals
+    HuffmanEncoder encoder(out);
+    for (int i = 0; i < num_lit_; ++i) {
+      encoder.scan(literals_[i]);
+    }
+    encoder.buildTable();
+    for (int i = 0; i < num_lit_; ++i) {
+      encoder.encode(literals_[i]);
+    }
+    int64_t bytes_written = encoder.finish();
+    out += bytes_written;
+    writeInt<3>(marker, bytes_written);
+    LOGV(1, "literals: %d -> %lld\n", num_lit_, bytes_written);
+  }
+  ...
+~~~
+
+And, last, we write out our match sequences:
+~~~ c++
+  ...
+  // Write sequences section
+  writeInt<3>(out, num_seq_);
+  out += 3;
+
+  // a. Literal lengths
+  int lit_len_out = writeValues<false>(out, literal_lengths_);
+  out += lit_len_out;
+  // b. Match offsets
+  int match_offsets_out = writeValues<true>(out, match_offsets_);
+  out += match_offsets_out;
+  // c. Match lengths
+  int match_lengths_out = writeValues<false>(out, match_lengths_);
+  out += match_lengths_out;
+
+  return out - out_start;
+}
+~~~
+
+The implementation of `writeValues` is straightforward, although note that we
+tell the Huffman encoder we only need a maximum of 32 symbols, so it can be
+significantly smaller.
+~~~ c++
+template< bool is_offset >
+int64_t LzEncoder::writeValues(uint8_t* out, const int* values) {
+  HuffmanEncoder encoder(out, 32);
+  for (int i = 0; i < num_seq_; ++i) {
+    encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
+  }
+  encoder.buildTable();
+  for (int i = 0; i < num_seq_; ++i) {
+    int v = values[i];
+    encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
+    LOGV(3, "Encoding %d -> %d (%d, %d)\n",
+         v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
+         is_offset ? offsetExtra(v) : lengthExtra(v));
+    if (v >= (is_offset ? 2 : 16)) {
+      int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
+      encoder.writer().writeBits(extra, log2(v));
+    }
+  }
+  return encoder.finish();
+}
+~~~
+
+We have now built our compression engine!  It is very basic, but fully functional.
+
+Decompression
+-------------
+
+Of course, it's not much use to compress data without being able to decompress
+it.  A huge advantage of LZ is that decompression is much easier than compression,
+giving it incredible speed.
+
+The whole decode process is very straightforward.  First, we Huffman decompress
+the literals and sequences, then we execute the sequences.  Executing the
+sequences is just copying bytes around:
+~~~ c++
+uint8_t* l_head = literals;
+for (int i = 0; i < num_seq; ++i) {
+  for (int j = 0; j < literal_lengths[i]; ++j) {
+    *out++ = *l_head++;
+  }
+  uint8_t* match_base = out - match_offsets[i];
+  for (int j = 0; j < match_lengths[i]; ++j) {
+    *out++ = match_base[j];
+  }
+}
+~~~
+
+Decoding the sequences is also very straightforward:
+~~~ c++
+uint8_t literals[1 << 18];
+int literal_lengths[1 << 16];
+int match_offsets[1 << 16];
+int match_lengths[1 << 16];
+
+{
+  int num_literals = readInt<3>(buf);
+  int compressed_size = readInt<3>(buf + 3);
+  buf += 6;
+
+  HuffmanDecoder decoder(buf, buf + compressed_size);
+  decoder.readTable();
+  decoder.decode(literals, literals + num_literals);
+  buf += compressed_size;
+}
+
+int num_seq = readInt<3>(buf);
+buf += 3;
+LOGV(1, "Read %d sequences\n", num_seq);
+
+buf += decodeValues(buf, end, num_seq, literal_lengths);
+buf += decodeValues(buf, end, num_seq, match_offsets);
+buf += decodeValues(buf, end, num_seq, match_lengths);
+~~~
+And that's it!
+
+Summary
+=======
+
+The [code](https://github.com/glinscott/linzip2/blob/master/main.cc)
+implements the ideas covered in this article.  It's less than 1000 lines of
+code, and I tried to find a good balance between speed and clarity.
+
+Huge thanks to folks like Charles Bloom, Yann Collet and Fabien Giesen for
+posting their work online.  Without their contributions, the field of
+compression would not be nearly as rich as it is.
+
+Thanks also to Morgan McGuire for the wonderful
+[Markdeep](https://casual-effects.com/markdeep/features.md.html#basicformatting/lists)
+library.
+
+References
+==========
+
+1. Fabien Giesen, [Reading bits in far too many
+   ways](https://fgiesen.wordpress.com/2018/02/19/reading-bits-in-far-too-many-ways-part-1/)
+
+1. Yann Collet, [ZStandard Compression
+   Format](https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md)
+
+1. Charles Bloom, [State of the Art
+   Huffman](http://cbloomrants.blogspot.com/2010/08/08-12-10-lost-huffman-paper.html)
+
+1. Charles Bloom, [Transmission of Huffman
+   Trees](http://cbloomrants.blogspot.com/2010/08/08-10-10-transmission-of-huffman-trees.html)
+
+1. Charles Bloom, [Length Limited Huffman
+   Codes](http://cbloomrants.blogspot.com/2010/07/07-03-10-length-limitted-huffman-codes.html)
+
+1. Charles Bloom, [Huffman
+   Performance](http://cbloomrants.blogspot.com/2015/10/huffman-performance.html)
+
+1. Charles Bloom, [Optimal LZ
+   Parsing](http://cbloomrants.blogspot.com/2008/10/10-10-08-7_10.html)
+
+1. Charles Bloom, [Learning from
+   Zstd](http://cbloomrants.blogspot.com/2017/09/some-learnings-from-zstd.html)
+
+1. Matt Mahoney, [Data Compression
+   Explained](http://cbloomrants.blogspot.com/2008/10/10-10-08-7_10.html)
+
+1. Yann Collet, [Realtime Data
+   Compression](http://fastcompression.blogspot.com)
+
+<!-- Markdeep: -->
+<style class="fallback">body{visibility:hidden;white-space:pre;font-family:monospace}</style>
+<script>window.markdeepOptions = {tocStyle: 'long'};</script>
+<script src="../markdeep.min.js"></script>
+<script src="https://casual-effects.com/markdeep/latest/markdeep.min.js"></script>
+<script>window.alreadyProcessedMarkdeep||(document.body.style.visibility="visible")</script>
