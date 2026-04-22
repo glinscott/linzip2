@@ -1298,59 +1298,64 @@ private:
     }
   }
 
+  template<typename ScanSymbolFn, typename EncodeSymbolFn>
+  int64_t writeSymbolStream(uint8_t* out, int max_symbols,
+                            ScanSymbolFn scan_symbol,
+                            EncodeSymbolFn encode_symbol) {
+    if (kUseFSE) {
+      uint8_t* end = scratch + kMaxChunkSize;
+      FSEEncoder encoder(end, max_symbols, kSequenceStateBits);
+      for (int i = 0; i < num_seq_; ++i) {
+        encoder.scan(scan_symbol(i));
+      }
+      encoder.buildTable();
+      for (int64_t i = num_seq_ - 1; i >= 0; --i) {
+        encode_symbol(encoder, i);
+      }
+      int64_t encoded_size = encoder.finish();
+      int64_t table_size = encoder.writeTable(out);
+      memmove(out + table_size, end - encoded_size, encoded_size);
+      return table_size + encoded_size;
+    } else {
+      HuffmanEncoder encoder(out, max_symbols);
+      for (int i = 0; i < num_seq_; ++i) {
+        encoder.scan(scan_symbol(i));
+      }
+      encoder.buildTable();
+      for (int i = 0; i < num_seq_; ++i) {
+        encode_symbol(encoder, i);
+      }
+      return encoder.finish();
+    }
+  }
+
   int64_t writeOffsets(uint8_t* out) {
     RepOffsets reps;
     for (int i = 0; i < num_seq_; ++i) {
       offset_symbols_[i] = offsetSymbol(match_offsets_[i], reps);
     }
 
-    if (kUseFSE) {
-      uint8_t* end = scratch + kMaxChunkSize;
-      FSEEncoder encoder(end, 64, kSequenceStateBits);
-      for (int i = 0; i < num_seq_; ++i) {
-        encoder.scan(offset_symbols_[i]);
-      }
-      encoder.buildTable();
-      for (int64_t i = num_seq_ - 1; i >= 0; --i) {
+    return writeSymbolStream(out, 64,
+      [&](int i) {
+        return offset_symbols_[i];
+      },
+      [&](auto& encoder, int i) {
         int offset = match_offsets_[i];
         int symbol = offset_symbols_[i];
         if (symbol >= 4) {
           encoder.writer().writeBits(offsetExtra(offset), log2(offset));
         }
         encoder.encode(symbol);
-      }
-      int64_t encoded_size = encoder.finish();
-      int64_t table_size = encoder.writeTable(out);
-      memmove(out + table_size, end - encoded_size, encoded_size);
-      return table_size + encoded_size;
-    } else {
-      HuffmanEncoder encoder(out, 64);
-      for (int i = 0; i < num_seq_; ++i) {
-        encoder.scan(offset_symbols_[i]);
-      }
-      encoder.buildTable();
-      for (int i = 0; i < num_seq_; ++i) {
-        int offset = match_offsets_[i];
-        int symbol = offset_symbols_[i];
-        encoder.encode(symbol);
-        if (symbol >= 4) {
-          encoder.writer().writeBits(offsetExtra(offset), log2(offset));
-        }
-      }
-      return encoder.finish();
-    }
+      });
   }
 
   template<bool is_offset>
   int64_t writeValues(uint8_t* out, const int* values) {
-    if (kUseFSE) {
-      uint8_t* end = scratch + kMaxChunkSize;
-      FSEEncoder encoder(end, 32, kSequenceStateBits);
-      for (int i = 0; i < num_seq_; ++i) {
-        encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
-      }
-      encoder.buildTable();
-      for (int64_t i = num_seq_ - 1; i >= 0; --i) {
+    return writeSymbolStream(out, 32,
+      [&](int i) {
+        return is_offset ? offsetCode(values[i]) : lengthCode(values[i]);
+      },
+      [&](auto& encoder, int i) {
         int v = values[i];
         if (v >= (is_offset ? 2 : 16)) {
           int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
@@ -1360,34 +1365,7 @@ private:
         LOGV(3, "Encoding %d -> %d (%d, %d)\n",
              v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
              is_offset ? offsetExtra(v) : lengthExtra(v));
-      }
-      int64_t encoded_size = encoder.finish();
-      int64_t table_size = encoder.writeTable(out);
-      memmove(out + table_size, end - encoded_size, encoded_size);
-      //printf("FSEBlock tot: %lld table:%lld encoded:%lld\n", table_size+encoded_size, table_size, encoded_size);
-      return table_size + encoded_size;
-    } else {
-      HuffmanEncoder encoder(out, 32);
-      for (int i = 0; i < num_seq_; ++i) {
-        encoder.scan(is_offset ? offsetCode(values[i]) : lengthCode(values[i]));
-      }
-      encoder.buildTable();
-      int64_t table_size = encoder.writer().finish();
-      for (int i = 0; i < num_seq_; ++i) {
-        int v = values[i];
-        encoder.encode(is_offset ? offsetCode(v) : lengthCode(v));
-        LOGV(3, "Encoding %d -> %d (%d, %d)\n",
-             v, is_offset ? offsetCode(v) : lengthCode(v), log2(v),
-             is_offset ? offsetExtra(v) : lengthExtra(v));
-        if (v >= (is_offset ? 2 : 16)) {
-          int extra = is_offset ? offsetExtra(v) : lengthExtra(v);
-          encoder.writer().writeBits(extra, log2(v));
-        }
-      }
-      int64_t tot = encoder.finish();
-      //printf("Hufblock tot: %lld table:%lld encoded:%lld\n", tot, table_size, tot-table_size);
-      return tot;
-    }
+      });
   }
 
   MatchFinder matcher_;
@@ -1451,12 +1429,22 @@ public:
   }
 
 private:
+  template<typename Decoder, typename DecodeSymbolFn>
+  int64_t decodeSymbolStream(uint8_t* buf, Decoder& decoder, int num_seq,
+                             int* values, DecodeSymbolFn decode_symbol) {
+    decoder.readTable();
+    for (int i = 0; i < num_seq; ++i) {
+      values[i] = decode_symbol(decoder, i);
+    }
+    decoder.br().byteAlign();
+    return decoder.br().cursor() - buf;
+  }
+
   int64_t decodeOffsets(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
     RepOffsets reps;
     if (kUseFSE) {
       FSEDecoder decoder(buf, end);
-      decoder.readTable();
-      for (int i = 0; i < num_seq; ++i) {
+      return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int symbol = decoder.decodeOne();
         int value = decodeOffsetSymbol(symbol, reps);
         if (kUseRepeatOffsets) {
@@ -1474,15 +1462,12 @@ private:
           decoder.br().refill();
           value |= decoder.br().readBits(extra_bits);
         }
-        values[i] = value;
-      }
-      decoder.br().byteAlign();
-      return decoder.br().cursor() - buf;
+        return value;
+      });
     } else {
       const int kSymBits = 6;
       HuffmanDecoder decoder(buf, end, kSymBits);
-      decoder.readTable();
-      for (int i = 0; i < num_seq; ++i) {
+      return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int symbol = decoder.decodeOne();
         int value = decodeOffsetSymbol(symbol, reps);
         if (kUseRepeatOffsets) {
@@ -1500,10 +1485,8 @@ private:
           decoder.br().refill();
           value |= decoder.br().readBits(extra_bits);
         }
-        values[i] = value;
-      }
-      decoder.br().byteAlign();
-      return decoder.br().cursor() - buf;
+        return value;
+      });
     }
   }
 
@@ -1511,8 +1494,7 @@ private:
   int64_t decodeValues(uint8_t* buf, uint8_t* end, int num_seq, int* values) {
     if (kUseFSE) {
       FSEDecoder decoder(buf, end);
-      decoder.readTable();
-      for (int i = 0; i < num_seq; ++i) {
+      return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int v = decoder.decodeOne();
         if (v >= (is_offset ? 2 : 16)) {
           int extra_bits = v - (is_offset ? 1 : 12);
@@ -1520,15 +1502,12 @@ private:
           decoder.br().refill();
           v |= decoder.br().readBits(extra_bits);
         }
-        values[i] = v;
-      }
-      decoder.br().byteAlign();
-      return decoder.br().cursor() - buf;
+        return v;
+      });
     } else {
       const int kSymBits = 5;
       HuffmanDecoder decoder(buf, end, kSymBits);
-      decoder.readTable();
-      for (int i = 0; i < num_seq; ++i) {
+      return decodeSymbolStream(buf, decoder, num_seq, values, [&](auto& decoder, int i) {
         int v = decoder.decodeOne();
         if (v >= (is_offset ? 2 : 16)) {
           int extra_bits = v - (is_offset ? 1 : 12);
@@ -1536,10 +1515,8 @@ private:
           decoder.br().refill();
           v |= decoder.br().readBits(extra_bits);
         }
-        values[i] = v;
-      }
-      decoder.br().byteAlign();
-      return decoder.br().cursor() - buf;
+        return v;
+      });
     }
   }
 };
