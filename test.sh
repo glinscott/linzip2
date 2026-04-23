@@ -3,4 +3,4 @@
 set -e
 
 ./build.sh
-./a.out
+./linzip_tests
