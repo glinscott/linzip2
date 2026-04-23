@@ -28,26 +28,35 @@ We will make four changes to the Part 1 compressor:
 
 | Stage | enwik8 | Silesia | What changed |
 | ----- | ------ | ------- | ------------ |
-| Huffman baseline | 34,566,563 | 65,599,514 | Huffman-coded literals and sequences |
-| + FSE sequence streams | 34,349,694 | 65,226,148 | Better entropy coding for sequence streams |
-| + repeat offsets | 34,316,448 | 64,388,765 | Cheaper symbols for repeated match distances |
-| + stateful parser | 34,314,243 | 64,003,456 | Parser understands repeat offsets and literal runs |
-| + literal table cleanup | 34,263,694 | 63,911,530 | Delta-coded symbols and RLE for literal Huffman tables |
+| Huffman baseline | 34,566,563 (34.57%) | 65,599,514 (30.95%) | Huffman-coded literals and sequences |
+| + FSE sequence streams | 34,349,694 (34.35%) | 65,226,148 (30.77%) | Better entropy coding for sequence streams |
+| + repeat offsets | 34,316,448 (34.32%) | 64,388,765 (30.38%) | Cheaper symbols for repeated match distances |
+| + stateful parser | 34,314,243 (34.31%) | 64,003,456 (30.19%) | Parser understands repeat offsets and literal runs |
+| + literal table cleanup | 34,263,694 (34.26%) | 63,911,530 (30.15%) | Delta-coded symbols and RLE for literal Huffman tables |
 
 Arithmetic Coding
 =================
 
 Before diving into FSE, it helps to look at the line of ideas that leads to it.
-Arithmetic coding, ANS, and FSE are all trying to do the same job: represent
+Arithmetic coding, ANS, and FSE are all trying to do the same job, representing
 symbols in proportion to their probabilities without the rigid code-length
 constraints of Huffman.
+
+A quick example illustrates this well. If a symbol shows up 90% of the time, the
+ideal cost is much less than one bit, but a Huffman code still has to spend at
+least one bit to represent it.  Arithmetic coding can use ~0.15 bits on average.
 
 Arithmetic coding does this by maintaining an interval. We start with `[0, 1)`,
 split it according to the symbol probabilities, and keep the subrange for the
 symbol we are encoding.  We then split the subrange by the symbol probabilities
 again, and so on until the whole message is consumed.
 
-!!! Historical Sidenote
+In the ideal mathematical picture, that interval can shrink indefinitely. The
+simplest possible encoder does not emit bits after every symbol - it just needs
+to write out any number in that final interval.  Note that this requires
+infinite precision, we'll discuss practical implementations next.
+
+!!! Sidenote History of Arithmetic Compression
     Arithmetic coding has its roots in the work of Claude Shannon, the father
     of information theory. The first practical implementations were developed in
     the 1970s and 1980s by researchers such as Jorma Rissanen, Glen Langdon, and
@@ -56,18 +65,8 @@ again, and so on until the whole message is consumed.
     in the late 1990s and early 2000s that arithmetic coding became more widely
     used.
 
-In the ideal mathematical picture, that interval can shrink indefinitely. The
-simplest possible encoder does not emit bits after every symbol - it just needs
-to write out any number in that final interval.  Note that this requires
-infinite precision, we'll discuss practical implementations next.
-
-As a toy example, suppose the symbol probabilities are:
-
-*   `A`: `0.45`
-*   `B`: `0.35`
-*   `C`: `0.20`
-
-and we want to encode `BAC`.
+As a toy example, suppose the symbol probabilities are `A = 0.45`, `B = 0.35`,
+and `C = 0.20`, and we want to encode `BAC`.
 
 ~~~diagram
                 .-------------------------------.
@@ -107,11 +106,9 @@ write 0.59 (any value in the range works)
 The decoder gets the same probability table, the final number, and the number
 of symbols to decode. It starts again from `[0, 1)`, asks which symbol subrange
 contains `0.59`, emits that symbol, restricts the interval to that subrange,
-and repeats:
-
-1. `0.59` lies in `B`'s subrange of `[0, 1)`, so decode `B`
-2. Inside `[0.45, 0.80)`, `0.59` lies in `A`'s subrange, so decode `A`
-3. Inside `[0.45, 0.6075)`, `0.59` lies in `C`'s subrange, so decode `C`
+and repeats. First, `0.59` lies in `B`'s subrange of `[0, 1)`, so we decode
+`B`. Inside `[0.45, 0.80)`, it lies in `A`'s subrange, so we decode `A`.
+Finally, inside `[0.45, 0.6075)`, it lies in `C`'s subrange, so we decode `C`.
 
 Note that the final number carries the message itself.  A real stream still
 needs a way to know when to stop, either from a symbol count or an end-of-stream
@@ -138,11 +135,12 @@ Asymmetric Numeral Systems (ANS)
 
 In the ideal arithmetic-coding picture, the interval can become arbitrarily
 small, so a real implementation has to keep renormalizing and carefully managing
-precision.
+precision.  This adds a lot of complexity and bookkeeping.
 
 ANS, developed by [Jarek Duda](https://en.wikipedia.org/wiki/Jarek_Duda) in
 2009, reframes the same bookkeeping in a much more machine-friendly way. Instead
-of tracking an interval, ANS tracks a single integer state.
+of tracking an interval, ANS tracks a single integer state.  The magic is that
+it still provides near-optimal compression.
 
 First we quantize the symbol probabilities into integer counts.
 
@@ -194,14 +192,6 @@ renormalize before it runs its own transition. So `B` forced us to spill first
 because it only owns 2 states. If the symbol were `A`, we would allow states up
 to `8 * 4 = 32` before renormalizing.
 
-!!! SideBar: Why rANS is best for static probabilities
-    rANS uses a state that is updated by multiplying with a scaled probability
-    and adding an offset. This makes it efficient when the probabilities are
-    known in advance and do not change. If the probabilities change, the
-    scaling factors and offsets need to be recomputed, which can be expensive.
-    For more details, see [Fabian Giesen's blog
-    post](https://fgiesen.wordpress.com/2015/12/21/rans-in-practice/).
-
 Finite State Entropy (FSE)
 =========================
 
@@ -209,11 +199,14 @@ FSE, developed by [Yann Collet](https://fastcompression.blogspot.com/), is a
 high-performance implementation of ANS. It's the entropy coder used in
 [zstd](https://github.com/facebook/zstd).
 
-In FSE, decode becomes a fast table lookup:
+FSE takes the ANS state transition and bakes most of the work into tables. That
+is the trade we want for LZ sequence streams. The alphabets are small, the
+probabilities are fixed for a block, and the decoder will run the same compact
+loop over and over.
 
-1. Which symbol this state emits
-2. How many bits we need to read
-3. How to reconstruct the next state
+In FSE, decode becomes a fast table lookup. The table tells us which symbol this
+state emits, how many bits we need to read, and how to reconstruct the next
+state.
 
 !!! Note FSE and Instruction-Level Parallelism
     A single FSE state machine has a tight dependency chain: each decoded symbol
@@ -260,11 +253,8 @@ Suppose the current state is `x = 23`, and the decoder table says:
 decode_[23] = { state = 40, num_bits = 3, symbol = B }
 ~~~
 
-Then decoding one symbol means:
-
-1. Output `B`
-2. Read 3 bits from the bitstream, say `101` = 5
-3. Compute the next state as `40 + 5 = 45`
+Then decoding one symbol means outputting `B`, reading 3 bits from the
+bitstream, say `101` = 5, and computing the next state as `40 + 5 = 45`.
 
 ### Step 1: Normalize frequencies
 
@@ -308,11 +298,9 @@ while (correction != 0) {
 This is still a heuristic, but it keeps the normalized table closer to the real
 distribution without making the code much more complicated.
 
-At the end of normalization:
-
-1. Every symbol that appeared at least once still has at least one state.
-2. The total number of states is exactly `state_len_`.
-3. More likely symbols own more states.
+At the end of normalization, every symbol that appeared at least once still has
+at least one state, the total number of states is exactly `state_len_`, and more
+likely symbols own more states.
 
 ~~~ none
 Normalization example (force counts to sum to 16 states)
@@ -336,10 +324,24 @@ D ##
 
 ### Step 2: Spread symbols across the state space
 
-Once the counts are normalized, we need to assign actual states to symbols.
-The current implementation uses the standard FSE-style permutation: walk
-through the state table with a fixed odd step and drop each symbol into the next
-slot it owns.
+After normalization, each symbol owns some number of states. Now we need to
+decide where those states live.
+
+Spreading the states across the table is key.  Imagine if all of a symbol's
+states point back into one small region. Then repeated symbols get stuck in that
+region, and the state machine spends bits fighting the table layout instead of
+representing the input distribution.
+
+!!! Note FSE Table Spreading
+    This is one of the trickier parts of FSE. Yann Collet's
+    [FSE: distributing symbol values](http://fastcompression.blogspot.com/2014/02/fse-distributing-symbol-values.html)
+    and [FSE: a closer look](http://fastcompression.blogspot.com/2014/02/fse-closer-look.html)
+    go deeper into why the table spread matters. The short version here is:
+    normalized counts decide how many states each symbol owns; the spread
+    decides where those states live.
+
+The implementation uses the standard FSE-style spread. Walk through the state
+table with a fixed odd step, and drop each symbol into the next slot it owns.
 
 ~~~ c++
 int mask = state_len - 1;
@@ -354,11 +356,15 @@ for (int symbol = 0; symbol < num_symbols; ++symbol) {
 }
 ~~~
 
-We need to ensure each symbol's states get spread through the table instead of
-being clumped together.  That keeps the state machine well mixed, while staying
-branch-light and fast.
+After this step, `sorted_symbols_[state]` is the decoder view. For each state,
+it tells us which symbol that state emits.
 
-With that order in hand, we can fill the packed transition table:
+The encoder wants the inverse view. It starts with a symbol and a rank inside
+that symbol's state range, and needs to find the actual FSE state to jump to.
+That is what `packed_table_` stores, a mapping from
+`(symbol, rank-within-symbol) -> state`.
+
+With the spread order in hand, we can fill that packed transition table:
 
 ~~~ c++
 for (int i = 0; i < state_len_; ++i) {
@@ -370,31 +376,39 @@ for (int i = 0; i < state_len_; ++i) {
 }
 ~~~
 
-Each symbol owns a contiguous slice in `packed_table_`, and each entry tells us
-which next state to jump to after we emit some bits.
+Each entry in `packed_table_` points back to one of the spread decoder states.
+So the decoder gets a well-spread table, while the encoder gets compact
+per-symbol ranges.
 
 ~~~ none
 Tiny state-spreading example (16 states)
-
-Simplified interleaved state slots:
-
-index:   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
-symbol:  A  B  A  C  A  B  A  C  A  B  A  C  A  B  A  C
 
 Counts:
   A -> 8 states
   B -> 4 states
   C -> 4 states
 
-Packed table subranges:
+With the 16-state step, `step = 13`, the decoder table is:
 
-A range: [ 0  1  2  3  4  5  6  7 ]
-B range: [ 8  9 10 11 ]
-C range: [12 13 14 15 ]
+index:   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+symbol:  A  A  B  C  A  B  C  A  B  C  A  A  C  A  A  B
+enc st: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
 
-The encoder uses the high bits of the current state as a subrange id, then
-jumps into that symbol's packed range.
+The packed table groups those spread states by symbol:
+
+A entries: [16, 17, 20, 23, 26, 27, 29, 30]
+B entries: [18, 21, 24, 31]
+C entries: [19, 22, 25, 28]
+
+The encoder can index into `A`'s compact range, but the value it gets sends the
+state machine back to one of `A`'s spread decoder states.
 ~~~
+
+!!! Note Encoder States
+    Why not store encoder states as `0..15` directly? In ANS, the state has to
+    stay in a normalized range with enough high bits to carry information
+    forward.  If the state gets too small, there is nowhere for the next symbol
+    to store its high bits, and the encode/decode mapping stops being reversible.
 
 ### Step 3: Build the per-symbol encoder parameters
 
@@ -415,13 +429,17 @@ for (int symbol = 0; symbol < max_symbols_; ++symbol) {
 }
 ~~~
 
-This code does two jobs:
-
-1. Decide how many low bits must be written to keep the state in range.
-2. Compute the base offset into that symbol's subrange of `packed_table_`.
+This code decides how many low bits must be written to keep the state in range,
+and computes the base offset into that symbol's subrange of `packed_table_`.
 
 The `delta_bits` formula is a branchless way of computing whether this
 particular state spills `k` or `k - 1` bits.
+
+!!! Note FSE Subrange Coding
+    The `delta_bits` and `delta_state` formulas are the compact version of FSE's
+    subrange coding step. Yann Collet's
+    [FSE Tricks: memory efficient subrange coding](http://fastcompression.blogspot.com/2014/02/fse-tricks-memory-efficient-subrange.html)
+    walks through the derivation in more detail.
 
 ### Step 4: Build the decoder table
 
@@ -438,11 +456,8 @@ for (int i = 0; i < state_len_; ++i) {
 }
 ~~~
 
-For each state we precompute:
-
-1. Which symbol to output.
-2. How many bits to pull from the bitstream.
-3. The base used to reconstruct the next state.
+For each state we precompute which symbol to output, how many bits to pull from
+the bitstream, and the base used to reconstruct the next state.
 
 This makes FSE decoding incredibly fast.
 
@@ -459,11 +474,8 @@ int subrange_id = state_ >> num_bits;
 state_ = packed_table_[subrange_id + encoded_[symbol].delta_state];
 ~~~
 
-Each symbol does three things:
-
-1. Spill a few low bits from `state_`.
-2. Use the remaining high bits to identify a subrange.
-3. Jump to the next state for that symbol.
+Each symbol spills a few low bits from `state_`, uses the remaining high bits to
+identify a subrange, then jumps to the next state for that symbol.
 
 After all symbols are done, we write the final state itself.
 
@@ -516,10 +528,13 @@ jump to next state                   reconstruct next state
 Integrating FSE into our LZ Compressor
 =====================================
 
-Zstd uses Huffman for literals, and FSE for the sequences: literal lengths,
-match lengths, and offset codes. Literal bytes have a large alphabet and are a
-good fit for Huffman, while the sequence alphabets are much smaller and fit FSE
-well.
+Zstd uses Huffman for literals, and FSE for the sequence streams of literal
+lengths, match lengths, and offset codes.
+
+Literal bytes have a 256-symbol alphabet, and Huffman is simple, fast, and good
+enough for that stream. Sequence streams (literal lengths, match lengths, and
+offset codes) have small alphabets with very skewed distributions.  Exactly the
+case where fractional-bit coding helps, and the FSE tables stay small.
 
 So that is the direction we will take here too: Huffman for the literal byte
 stream, FSE for the sequence symbol streams.
@@ -549,9 +564,9 @@ symbol they belong to, so they also go out in reverse.
 ### FSE-only results
 
 Compared to the clean Part 1 Huffman baseline, this change gets enwik8 from
-34,566,563 bytes down to 34,349,694, and Silesia from 65,599,514 down to
-65,226,148. It is a solid win on both corpora, but there is still more work to
-do.
+34,566,563 (34.57%) bytes down to 34,349,694 (34.35%), and Silesia from
+65,599,514 (30.95%) down to 65,226,148 (30.77%). It is a solid win on both
+corpora, but there is still more work to do.
 
 Repeat Offsets
 ==============
@@ -634,8 +649,9 @@ for (int j = 0; j < match_lengths[i]; ++j) {
 
 ### Repeat-offset results
 
-Enwik8 goes from 34,349,694 bytes to 34,316,448. Silesia goes from 65,226,148
-to 64,388,765. The gain is modest on enwik8, but large on Silesia.
+Enwik8 goes from 34,349,694 (34.35%) bytes to 34,316,448 (34.32%). Silesia goes
+from 65,226,148 (30.77%) to 64,388,765 (30.38%). The gain is modest on enwik8,
+but large on Silesia.
 
 ### Improving the Parser to Understand Repeats
 
@@ -643,19 +659,17 @@ Once repeat offsets are in place, the parser needs to understand them too.
 Otherwise it will still choose matches as if all offsets cost about the same,
 and it will miss many of the cheap "reuse the last offset" opportunities.
 
-The parser now has to solve a different problem:
-
-*   At each byte position we can emit either another literal or a match.
-*   The cost of a match now depends on more than just its length and distance.
-*   In particular, the cost depends on the current repeat-offset history and on
-    how many literals are still pending before the next match.
+The parser now has to solve a different problem. At each byte position we can
+emit either another literal or a match, but the cost of a match now depends on
+more than just its length and distance. In particular, it depends on the current
+repeat-offset history and on how many literals are still pending before the next
+match.
 
 The parser has to reason about **state**, not just local match quality.  The
 brute-force version would keep multiple parser states per position.  The simpler
-version used here keeps only **one winning state per position**:
-
-1. The current repeat-offset history
-2. The number of pending literals since the last match
+version used here keeps only **one winning state per position**, including the
+current repeat-offset history and the number of pending literals since the last
+match.
 
 This leads naturally to dynamic programming. For each position we store the best
 known way to arrive there, together with the parser state that future costs
@@ -670,10 +684,8 @@ std::vector<ParseStep> steps(length + 1);
 cost[0] = 0;
 ~~~
 
-At each position we consider two kinds of edges:
-
-*   Emit one more literal byte
-*   Close the current literal run and emit a match
+At each position we consider two kinds of edges, either emitting one more
+literal byte or closing the current literal run and emitting a match.
 
 The literal edge is straightforward:
 
@@ -703,8 +715,8 @@ optimality to keep the parse fast and simple.
 ### Final repeat-offset results
 
 Using that parser on top of the repeat-offset format gets enwik8 from
-34,316,448 bytes down to 34,314,243, and Silesia from 64,388,765 down to
-64,003,456.
+34,316,448 (34.32%) bytes down to 34,314,243 (34.31%), and Silesia from
+64,388,765 (30.38%) down to 64,003,456 (30.19%).
 
 !!! Note Tuning hyperparameters
     A compressor has many different hyperparameters to tune.  For example,
@@ -713,8 +725,8 @@ Using that parser on top of the repeat-offset format gets enwik8 from
 
     The final numbers in this article use `max_matches = 16`.
 
-    *   `enwik8`: `34,263,694` with `16`, versus `35,481,328` with `8`
-    *   `Silesia`: `63,911,530` with `16`, versus `65,649,784` with `8`
+    *   `enwik8`: `34,263,694` (34.26%) with `16`, versus `35,481,328` (35.48%) with `8`
+    *   `Silesia`: `63,911,530` (30.15%) with `16`, versus `65,649,784` (30.97%) with `8`
 
 
 Literal Table Cleanup
@@ -722,10 +734,9 @@ Literal Table Cleanup
 
 One remaining source of overhead is the literal Huffman table. We are still
 writing one `(symbol, code length)` pair per used symbol in every block. Two
-small fixes help:
-
-1. Symbols are sorted, so symbol ids can be delta-coded. We can use a simple
-   trick of storing small values in fewer bits, escaping out to bigger values.
+small fixes help. First, symbols are sorted, so symbol ids can be delta-coded.
+We can use a simple trick of storing small values in fewer bits, escaping out to
+bigger values.
 
 ~~~ c++
 void writeSmallValue(BitWriter& writer, int v) {
@@ -742,8 +753,8 @@ void writeSmallValue(BitWriter& writer, int v) {
 }
 ~~~
 
-2. Many adjacent symbols share the same code length, so code lengths can be
-   run-length encoded.  Again, a minimal implementation.
+Many adjacent symbols share the same code length, so code lengths can also be
+run-length encoded.  Again, a minimal implementation.
 
 ~~~ c++
 writer_.writeBits(codelen - 1, 4);
@@ -757,8 +768,8 @@ for (int j = 0; j < run; ++j) {
 
 ### Literal-table results
 
-This trims enwik8 from 34,314,243 bytes to 34,263,694, and Silesia from
-64,003,456 to 63,911,530.
+This trims enwik8 from 34,314,243 (34.31%) bytes to 34,263,694 (34.26%), and
+Silesia from 64,003,456 (30.19%) to 63,911,530 (30.15%).
 
 Benchmark Notes
 ===============
@@ -767,9 +778,9 @@ Here is what zstd looks like on the same inputs.
 
 | Stage | enwik8 | Silesia |
 | ----- | ------ | ------- |
-| Ours | 34,263,694 | 63,911,530 |
-| zstd 1.5.7 `-3` reference | 35,445,335 | 66,217,545 |
-| zstd 1.5.7 `-9` reference | 31,129,515 | 59,190,849 |
+| Ours | 34,263,694 (34.26%) | 63,911,530 (30.15%) |
+| zstd 1.5.7 `-3` reference | 35,445,335 (35.45%) | 66,217,545 (31.24%) |
+| zstd 1.5.7 `-9` reference | 31,129,515 (31.13%) | 59,190,849 (27.92%) |
 
 However, encoding is much slower.  Nearly all the time is in our "optimal"
 parse. Production parsers use many more tricks to keep this search fast.
