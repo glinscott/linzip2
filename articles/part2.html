@@ -104,15 +104,18 @@ Split [0.45, 0.6075):
 write 0.59 (any value in the range works)
 ~~~
 
-The decoder gets the same probability table and that final number. It starts
-again from `[0, 1)`, asks which symbol subrange contains `0.59`, emits that
-symbol, restricts the interval to that subrange, and repeats:
+The decoder gets the same probability table, the final number, and the number
+of symbols to decode. It starts again from `[0, 1)`, asks which symbol subrange
+contains `0.59`, emits that symbol, restricts the interval to that subrange,
+and repeats:
 
 1. `0.59` lies in `B`'s subrange of `[0, 1)`, so decode `B`
 2. Inside `[0.45, 0.80)`, `0.59` lies in `A`'s subrange, so decode `A`
 3. Inside `[0.45, 0.6075)`, `0.59` lies in `C`'s subrange, so decode `C`
 
-Note that all we needed was 0.59 to decode the entire message.
+Note that the final number carries the message itself.  A real stream still
+needs a way to know when to stop, either from a symbol count or an end-of-stream
+symbol.
 
 !!! SideBar: Range Coding
     Range coding is a variant of arithmetic coding that uses integer ranges
@@ -161,14 +164,14 @@ high_part = state / sym_freq
 new_state = high_part * 8 + sym_base + low_part
 ~~~
 
-To avoid requiring infinite precision, `low_part` must fit in the range owned by
-the symbol. If it doesn't, we spill some low bits until it can. Because common
-symbols own larger ranges, they spill less often and therefore cost fewer bits
+To avoid requiring infinite precision, we keep the state inside a fixed working
+range. Before encoding a symbol, we spill low bits until the state is small
+enough for that symbol's transition. Because common symbols own larger ranges,
+they can accept larger states, spill less often, and therefore cost fewer bits
 on average.
 
 For this toy example, we'll use a simple renormalization rule: before encoding a
-symbol, require `state < 8 * sym_freq`. Since `sym_freq` is at most 4 here, that
-keeps the state below 32.
+symbol with frequency `sym_freq`, require `state < 8 * sym_freq`.
 
 If the next symbol is `B`, then `sym_freq = 2`, so we need `state < 16`.
 Suppose `state = 29`. That is too large, so we spill one low bit:
@@ -178,7 +181,7 @@ write 29 & 1 = 1
 state = 29 >> 1 = 14
 ~~~
 
-Now the state fits. We can encode `B` using `sym_base = 4`:
+Now the input state fits. We can encode `B` using `sym_base = 4`:
 
 ~~~ none
 low_part  = 14 % 2 = 0
@@ -186,8 +189,10 @@ high_part = 14 / 2 = 7
 new_state = 7 * 8 + 4 + 0 = 60
 ~~~
 
-So `B` forced us to spill first because it only owns 2 states. If the symbol
-were `A`, we would allow states up to `8 * 4 = 32` before renormalizing.
+The encoded state is larger again, which is fine: the next symbol will
+renormalize before it runs its own transition. So `B` forced us to spill first
+because it only owns 2 states. If the symbol were `A`, we would allow states up
+to `8 * 4 = 32` before renormalizing.
 
 !!! SideBar: Why rANS is best for static probabilities
     rANS uses a state that is updated by multiplying with a scaled probability
@@ -211,11 +216,11 @@ In FSE, decode becomes a fast table lookup:
 3. How to reconstruct the next state
 
 !!! Note FSE and Instruction-Level Parallelism
-    Because FSE decodes backwards, you can maintain two or four separate state
-    machines, reading from interleaved bitstreams in the same loop. This breaks
-    the data dependency chain of a single state machine, allowing a superscalar
-    CPU to decode multiple symbols simultaneously per clock cycle.  In practice,
-    this is a 2-4x speedup.
+    A single FSE state machine has a tight dependency chain: each decoded symbol
+    produces the next state. Real implementations often keep two or four
+    independent FSE states and interleave their bitstreams in the same loop.
+    This gives a superscalar CPU independent work to issue each cycle. In
+    practice, this is a 2-4x speedup.
 
 ### FSE Tables
 
@@ -371,7 +376,7 @@ which next state to jump to after we emit some bits.
 ~~~ none
 Tiny state-spreading example (16 states)
 
-Interleaved state slots:
+Simplified interleaved state slots:
 
 index:   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
 symbol:  A  B  A  C  A  B  A  C  A  B  A  C  A  B  A  C
@@ -564,17 +569,32 @@ struct RepOffsets {
 ~~~
 
 Then, when encoding offsets, we first try to map them to one of these recent
-values:
+values. When an older repeat is used, it moves to the front. When a new offset
+is used, it becomes the new most recent offset.
 
 ~~~ c++
+if (offset == 0) return 0;
 if (offset == reps.rep[0]) return 1;
-if (offset == reps.rep[1]) return 2;
-if (offset == reps.rep[2]) return 3;
+if (offset == reps.rep[1]) {
+  std::swap(reps.rep[0], reps.rep[1]);
+  return 2;
+}
+if (offset == reps.rep[2]) {
+  int dist = reps.rep[2];
+  reps.rep[2] = reps.rep[1];
+  reps.rep[1] = reps.rep[0];
+  reps.rep[0] = dist;
+  return 3;
+}
+reps.rep[2] = reps.rep[1];
+reps.rep[1] = reps.rep[0];
+reps.rep[0] = offset;
 return 3 + offsetCode(offset);
 ~~~
 
-The first three values are repeat-offset symbols. Anything larger is a normal
-"absolute" offset code plus extra bits.
+Symbol 0 is the final literal-only sequence. The next three values are
+repeat-offset symbols. Anything larger is a normal "absolute" offset code plus
+extra bits.
 
 The offset stream is extremely skewed in real data.  Repeated nearby offsets
 show up constantly, especially in structured data. Once those common cases
@@ -662,7 +682,8 @@ int lit_cost = cost[i] + literalBytePrice(buffer[p + i]);
 ~~~
 
 The match edge requires us to estimate the literal, offset and match length.
-Once we've chosen a match cost, we have to update the statistics as well.
+Once we've chosen a match cost, we update the parser state that future prices
+depend on.
 
 ~~~ c++
 int match_cost = cost[i]
@@ -750,8 +771,8 @@ Here is what zstd looks like on the same inputs.
 | zstd 1.5.7 `-3` reference | 35,445,335 | 66,217,545 |
 | zstd 1.5.7 `-9` reference | 31,129,515 | 59,190,849 |
 
-However, encoding is much slower.  Nearly all the time is in the "optimal"
-parse, which has many more tricks that could be used.
+However, encoding is much slower.  Nearly all the time is in our "optimal"
+parse. Production parsers use many more tricks to keep this search fast.
 
 | Stage | enwik8 | Silesia |
 | ----- | ------ | ------- |
@@ -766,9 +787,9 @@ compressor a little closer to modern practice: Huffman literals, FSE-coded
 sequence streams, repeat offsets, optimized table storage, and finally a parser
 that is aware of that sequence structure.
 
-A key takeaway is that most compression gains come from searching for a better
-symbol stream structure.  Once you have an optimal entropy coder, the key is
-finding the right way to break up the data so it can compress them well.
+A key takeaway is that many compression gains come from searching for a better
+symbol stream structure. Once the entropy coder is good enough, the next job is
+finding the right way to break up the data so that stream compresses well.
 
 The [code](https://github.com/glinscott/linzip2/blob/master/main.cc)
 implements the ideas covered in this article.
